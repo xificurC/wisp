@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Mock curl that emits a malformed data line to exercise the skip path.
+
+printf 'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\n'
+printf 'data: THIS IS NOT JSON\n\n'
+printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+printf 'data: %s\n\n' "[DO""NE]"

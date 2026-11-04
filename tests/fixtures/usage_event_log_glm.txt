@@ -1,0 +1,3 @@
+data: {"id":"g1","model":"GLM 5.3 Flash","choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":1000,"prompt_tokens":1000,"total_tokens":2000,"completion_tokens_details":{"reasoning_tokens":0}}}
+data: {"id":"g2","model":"GLM 5.3 Flash","choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":1000,"prompt_tokens":2000,"total_tokens":3000,"completion_tokens_details":{"reasoning_tokens":0}}}
+data: {"id":"g3","model":"GLM 5.3 Flash","choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":1000,"prompt_tokens":4000,"total_tokens":5000,"completion_tokens_details":{"reasoning_tokens":0}}}
