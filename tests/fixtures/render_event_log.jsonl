@@ -1,0 +1,4 @@
+{"type":"user","content":"hi"}
+{"type":"assistant","output":[{"type":"reasoning","text":"let me think"},{"type":"text","text":"Hello"},{"type":"tool_call","id":"call_1","name":"bash","arguments":"{\"command\":\"echo hi\"}"}],"finish_reason":"tool_calls","usage":[]}
+{"type":"tool","call_id":"call_1","name":"bash","content":"hi"}
+{"type":"tool","call_id":"call_2","name":"bash","content":"ls\n(exit code: 1)"}

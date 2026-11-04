@@ -1,0 +1,3 @@
+data: {"id":"c1","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":10000,"prompt_tokens":100000,"total_tokens":60000,"prompt_tokens_details":{"cached_tokens":50000}}}
+data: {"id":"c2","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":12000,"prompt_tokens":120000,"total_tokens":72000,"prompt_tokens_details":{"cached_tokens":60000}}}
+data: {"id":"c3","model":"deepseek-v4-flash","choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":15000,"prompt_tokens":140000,"total_tokens":87000,"prompt_tokens_details":{"cached_tokens":70000}}}

@@ -1,0 +1,4379 @@
+#!/usr/bin/env python3
+"""wisp - minimal single-file agent harness, python3 standard library only.
+
+  wisp new --name NAME -m MODEL [-t THINKING] [-s SYSFILE]
+           [--env-in-system-prompt] [--parent DIR]   # child sessions: give it always
+  wisp run [-d DIR] < prompt
+  wisp steer [-d DIR] < message
+  wisp continue [-d DIR]
+  wisp response [-d DIR]
+  wisp skill ls
+  wisp skill read SKILL
+  wisp agents-md ls
+  wisp agents-md read-all
+  wisp build-system-prompt [--skills] [--agents-md] [--wisp] < extra
+  wisp render-live
+  wisp render-past [-d DIR]
+  wisp usage [-d DIR]
+  wisp ls [--global | --tree [-d DIR]]
+  wisp grep [-i] [--global | --tree [-d DIR]] PATTERN
+
+wisp run streams the current turn to stdout as raw `data:` SSE lines and
+commits each completed round to <DIR>/wisp.jsonl as it ends. Tool calls and
+their results are injected into the same stream as `data:` records, so
+the two sources are exclusive and a renderer can follow either one.
+
+wisp steer queues one steering message for a run: the message lands as
+one JSON line in <DIR>/wisp.steer.inbox, and a live `wisp run` drains
+the inbox at each round boundary and appends each line as a user
+record marked wisp_steered, with one `data: {"wisp":"steer"}` line on
+the stream. Steering never opens a segment and never resets the round
+counter. A run that ends with messages still waiting warns on stderr;
+the next `wisp run` injects them before its prompt, so no message is
+lost.
+
+wisp render-live opens each thinking block with a `[think]` marker line and
+each output block with an `[answer]` marker line, prints each tool-call
+header as `[bash 5s 5kb]` with the command on the next line, and prints
+each tool result behind a 🟢 exit=0 or a 🔴 exit=N dot line.
+Tools: bash and python3, 5s default timeout, 5kB default output cap,
+spill files under <DIR>/spill/ only when the output overflows the
+cap or the command itself exceeds 64kB, never deleted. load_image
+puts an image file into the conversation; it resizes to the default
+limits unless the call sets resize false.
+
+Run a session from one shell command to the next: take the path from
+`wisp new` and export it in one line:
+
+  export WISP_SESSION_DIR=$(wisp new --name NAME -m MODEL)
+
+Give --parent DIR to every child session. A child without --parent
+is an orphan. `wisp ls --tree` and `wisp grep --tree` cannot see an
+orphan.
+
+WISP_SESSION_DIR binds the session dir: -d DIR wins, then WISP_SESSION_DIR, for
+run, continue, steer, render-past, usage and response; without both they fail.
+ls and grep bind a session dir only in --tree scope. The value
+must be a session dir that holds wisp.jsonl. The value must be exported; a
+plain shell assignment does not reach the wisp child process. skill,
+agents-md and build-system-prompt take no -d; they scan the CWD walk
+and the user-level places.
+
+Env: WISP_SESSION_DIR, WISP_SESSIONS_ROOT, WISP_LLM_URL, WISP_LLM_API_KEY,
+WISP_LLM_MAX_TURNS.
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import io
+import json
+import os
+import select
+import signal
+import random
+import re
+import string
+import subprocess
+import sys
+import traceback
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Iterator
+from datetime import datetime
+from typing import Any, Callable
+
+
+# --- world ------------------------------------------------------------------
+# All IO goes through the world, never direct, so a test world can swap
+# the IO services freely.
+
+class World:
+    def __init__(self, registry: dict[str, Callable[[World], Any]]):
+        self._registry = dict(registry)
+        self._cache: dict[str, Any] = {}
+
+    def get(self, name: str) -> Any:
+        if name in self._cache:
+            return self._cache[name]
+        if name not in self._registry:
+            raise KeyError(name)
+        self._cache[name] = self._registry[name](self)
+        return self._cache[name]
+
+    def set(self, name: str, value: Any) -> None:
+        """Set a run-scoped value, bypassing lazy instantiation."""
+        self._cache[name] = value
+
+
+# --- minimal IO that every layer needs ---------------------------------------
+
+class Stdio:
+    """Writer for one text stream. stdout and stderr share the class."""
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+
+    def write(self, text: str) -> None:
+        self._stream.write(text)
+        self._stream.flush()
+
+
+class StdinFile:
+    """stdin through the world: whole text, live lines, or the tty check."""
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+
+    def read_text(self) -> str:
+        return self._stream.read()
+
+    def lines(self) -> Iterator[str]:
+        for line in self._stream:
+            yield line.rstrip("\n")
+
+    def is_interactive(self) -> bool:
+        return self._stream.isatty()
+
+
+def fail(world: World, message: str) -> None:
+    """Print one stderr error line and exit 1."""
+    world.get("stderr").write("wisp: %s\n" % message)
+    raise SystemExit(1)
+
+
+def safe_log(world: World, event: str, *fields: str) -> None:
+    """One wisp.log line through the session service; never raises.
+
+    A failure that lands before the session dir is set drops the
+    line, so observability cannot turn one clean failure into a
+    second one. Every event that runs outside the normal turn flow
+    - process exit, crashes, HTTP errors - logs through this."""
+    try:
+        world.get("session").log(event, *fields)
+    except (KeyError, AttributeError, TypeError, OSError):
+        pass
+
+
+DEFAULT_MAX_TURNS = 99999
+DEGENERATE_ATTEMPTS = 3     # textless attempts allowed before the run fails
+RETRY_NUDGE = "Continue where you left off"
+"""The user message a textless attempt earns before the next try.
+
+A plain resend repeats the same request, so an endpoint that answered
+with an empty stream or a thinking-only stop tends to answer the same
+way again. The nudge makes every retry a new request."""
+GUARD_EXIT = 75             # context guard stop, EX_TEMPFAIL; no other
+                            # wisp path exits 75
+DEFAULT_TOOL_TIMEOUT = 5     # seconds, shared by both tools
+DEFAULT_TOOL_MAXKB = 5       # kilobytes, shared by both tools
+DEFAULT_THINK_FIELDS = "reasoning_content,reasoning,thought"
+
+
+# --- command handlers ---------------------------------------------------------
+
+def new_session(world: World, opts: Any) -> int:
+    """Create the session dir under the sessions root: the --name, else a
+    rand8. Capture the run setup on disk: model and thinking into
+    wisp.run.json, the system record as the first wisp.jsonl entry when
+    -s is given. Fails on an existing session dir. Prints the full path.
+    With --parent DIR, the validated real parent path lands in the
+    child's wisp.run.json through the setup write, and the child id
+    lands in the parent's children list through link_child."""
+    name = opts.name or world.get("rng").token(8)
+    path = os.path.join(sessions_root(world), name)
+    if world.get("fs").exists(path):
+        fail(world, "session dir already exists: %s" % path)
+    parent_path = (validate_parent_dir(world, opts.parent)
+                   if opts.parent else None)
+    world.get("fs").mkdir(path)
+    register_sessions_root(world, sessions_root(world))
+    session = world.get("session")
+    session.write_run_setup(path, opts.model, opts.thinking,
+                            parent=parent_path)
+    system_text = None
+    if opts.sysfile:
+        system_text = world.get("fs").read_text(opts.sysfile)
+        if opts.env_in_system_prompt:
+            system_text = (environment_block(
+                session_dir=os.path.abspath(path),
+                sessions_root=os.path.abspath(sessions_root(world)),
+                project_dir=git_root(world) or world.get("fs").cwd(),
+                created=datetime.now().astimezone().isoformat(
+                    timespec="seconds"),
+                model=opts.model, thinking=opts.thinking or "")
+                + "\n\n" + system_text)
+    session.write_initial_log(path, system_text)
+    if parent_path:
+        link_child(world, parent_path, name)
+    world.get("stdout").write(path + "\n")
+    return 0
+
+
+def validate_parent_dir(world: World, raw: str) -> str:
+    """Validate one --parent session dir and return its real path.
+
+    The dir must exist and hold wisp.jsonl and wisp.run.json; each
+    missing piece fails with one stderr line, before any dir is
+    made. Existence only: a parent with a broken wisp.run.json
+    passes here and link_child warns best-effort. Returns
+    fs.realpath(raw).
+    """
+    fs = world.get("fs")
+    if not fs.isdir(raw):
+        fail(world, "wisp new: --parent is not a session dir: %s" % raw)
+    if not fs.exists(os.path.join(raw, "wisp.jsonl")):
+        fail(world, "wisp new: --parent session dir has no wisp.jsonl: %s" % raw)
+    if not fs.exists(os.path.join(raw, "wisp.run.json")):
+        fail(world, "wisp new: --parent session dir has no wisp.run.json: %s" % raw)
+    return fs.realpath(raw)
+
+
+def link_child(world: World, parent_path: str, child_id: str) -> None:
+    """Append one child id to the parent's children list.
+
+    Reads <parent_path>/wisp.run.json, appends child_id to children
+    (created when absent, skipped when already present), preserves
+    every other key, writes one sorted JSON line. Best-effort: any
+    failure warns on one stderr line and returns; the exit code never
+    changes. The race guard compares the file mtime between read and
+    write; a change warns that a parallel child link may be lost,
+    and the write still lands, last-writer-wins.
+    """
+    fs = world.get("fs")
+    stderr = world.get("stderr")
+    path = parent_path + "/wisp.run.json"
+    try:
+        before = fs.mtime(path)
+        text = fs.read_text(path)
+    except OSError:
+        stderr.write("wisp: warning: cannot link child %s under %s: "
+                     "no readable wisp.run.json\n" % (child_id, parent_path))
+        return
+    try:
+        setup = json.loads(text)
+    except ValueError:
+        stderr.write("wisp: warning: cannot link child %s under %s: "
+                     "wisp.run.json is not JSON\n" % (child_id, parent_path))
+        return
+    if not isinstance(setup, dict):
+        stderr.write("wisp: warning: cannot link child %s under %s: "
+                     "wisp.run.json is not an object\n" % (child_id, parent_path))
+        return
+    children = setup.get("children")
+    if children is None:
+        children = []
+    if not isinstance(children, list):
+        stderr.write("wisp: warning: cannot link child %s under %s: "
+                     "children is not a list\n" % (child_id, parent_path))
+        return
+    if child_id in children:
+        return
+    children.append(child_id)
+    setup["children"] = children
+    try:
+        if fs.mtime(path) != before:
+            stderr.write("wisp: warning: parent wisp.run.json changed during "
+                         "the update; a parallel child link may be lost: %s\n"
+                         % path)
+        fs.write_text(path, json.dumps(setup, sort_keys=True) + "\n")
+    except OSError:
+        stderr.write("wisp: warning: cannot update children of %s\n"
+                     % parent_path)
+        return
+
+
+def sessions_root(world: World) -> str:
+    """The session folder root: WISP_SESSIONS_ROOT verbatim when set,
+    else <project-root>/wisp-sessions/ (project root = git root, else
+    the current directory)."""
+    root = world.get("env").get("WISP_SESSIONS_ROOT")
+    if root:
+        return os.path.expanduser(root)
+    return os.path.join(git_root(world) or world.get("fs").cwd(), "wisp-sessions")
+
+
+def state_root(world: World) -> str:
+    """The registry root: WISP_STATE_ROOT when set, else
+    <XDG_STATE_HOME> or <HOME>/.local/state, plus /wisp-sessions."""
+    env = world.get("env")
+    override = env.get("WISP_STATE_ROOT")
+    if override:
+        return os.path.expanduser(override)
+    base = (env.get("XDG_STATE_HOME")
+            or os.path.join(home_dir(env), ".local", "state"))
+    return os.path.join(os.path.expanduser(base), "wisp-sessions")
+
+
+def registry_link_name(root: str) -> str:
+    """The link name: the root with every / as __, cut to the last
+    255 bytes when too long."""
+    data = root.replace("/", "__").encode("utf-8")
+    if len(data) > 255:
+        data = data[-255:]
+    return data.decode("utf-8", errors="ignore")
+
+
+def register_sessions_root(world: World, root: str) -> None:
+    """One link per project under the state root: the link name is the
+    real path of the sessions root encoded by registry_link_name, the
+    target is the real path. Best-effort, like link_child: any failure
+    warns on one stderr line and returns; the exit code never changes
+    and wisp new still prints the session dir. Idempotent: a link with the
+    same target stays; a different target, a plain file, or a dangling
+    link is removed and the link recreated. wisp never deletes a
+    registry link except in that repair."""
+    fs = world.get("fs")
+    try:
+        state = state_root(world)
+        fs.mkdir(state)
+        real = fs.realpath(root)
+        link = os.path.join(state, registry_link_name(real))
+        if fs.islink(link) and fs.readlink(link) == real:
+            return
+        if fs.islink(link) or fs.exists(link):
+            fs.remove(link)
+        fs.symlink(real, link)
+    except OSError as exc:
+        world.get("stderr").write("wisp: warning: registry: %s\n" % exc)
+
+
+def skill_command(world: World, opts: Any) -> int:
+    """Dispatch `skill ls` and `skill read SKILL`."""
+    out = world.get("stdout")
+    if opts.sub == "ls":
+        for name, desc, path in collect_skills(world):
+            out.write("%s: %s (%s)\n" % (name, desc, path))
+        return 0
+    if opts.sub == "read":
+        path = resolve_skill_path(world, opts.skill)
+        if not path:
+            fail(world, "skill not found: %s" % opts.skill)
+        out.write(skill_block(world, opts.skill, path) + "\n")
+        return 0
+    fail(world, "wisp skill: use ls, or read SKILL")
+
+
+def xml_block(tag: str, src: str | None, text: str) -> str:
+    """One prompt part in an XML block; src names the file when the
+    part is read from one."""
+    head = "<%s%s>" % (tag, ' src="%s"' % src if src else "")
+    return "%s\n%s\n</%s>" % (head, text, tag)
+
+
+def agents_md_command(world: World, opts: Any) -> int:
+    """Dispatch `agents-md ls` and `agents-md read-all`."""
+    docs = agents_md_files(world)
+    out = world.get("stdout")
+    if opts.sub == "ls":
+        for path in docs:
+            out.write(path + "\n")
+        return 0
+    if opts.sub == "read-all":
+        out.write("\n\n".join(
+            xml_block("agents-md", p, world.get("fs").read_text(p)) for p in docs
+        ) + "\n" if docs else "")
+        return 0
+    fail(world, "wisp agents-md: use ls or read-all")
+
+
+ENVIRONMENT_LINES_TEMPLATE = """\
+SESSION DIR: {session_dir}
+SESSIONS ROOT: {sessions_root}
+PROJECT DIR: {project_dir}
+SESSION CREATION TIME: {created}
+MODEL: {model}
+THINKING: {thinking}"""
+
+
+def environment_block(session_dir: str, sessions_root: str, project_dir: str,
+                      created: str, model: str = "",
+                      thinking: str = "") -> str:
+    """The environment for one new run in one XML block, built fresh on
+    each call from the values computed at new time. The tag names the
+    block; the lines carry hard values only. MODEL is required at new
+    time, so its line always lands. THINKING lands only when the run
+    sets it; a run on the default thinking set drops the line."""
+    lines = ENVIRONMENT_LINES_TEMPLATE.format(
+        session_dir=session_dir, sessions_root=sessions_root,
+        project_dir=project_dir, created=created,
+        model=model, thinking=thinking).split("\n")
+    if not thinking:
+        lines = [line for line in lines if not line.startswith("THINKING:")]
+    return xml_block("environment", None, "\n".join(lines))
+
+
+def skills_preamble() -> str:
+    """The preamble that opens the <skills> block."""
+    return """\
+These are the available skills. When the user request fits a skill's
+description, read the skill file first and follow it."""
+
+
+def wisp_block() -> str:
+    """The wisp block: harness contract, session dir file map, turn model,
+    subagents recipe. Built fresh on each call. <sessiondir> stays
+    literal; build-system-prompt learns no session dir, the reader
+    maps it to the SESSION DIR line of the ENVIRONMENT block that
+    wisp new writes at creation time."""
+    return """\
+HARNESS
+
+You have three tools: bash, python3, and load_image.
+Each bash or python3 call takes three arguments: command, timeoutSeconds, maxKilobytes.
+The defaults are 5 seconds and 5 kilobytes.
+A timeout stops the command and returns exit code 124.
+wisp writes output larger than maxKilobytes to <sessiondir>/spill/<random-name>.
+The tool note names that spill path. Spill files are never deleted.
+wisp keeps the first 5 kilobytes of overflow output in the result.
+Read the rest with: tail -c +5001 <spill-path>
+Set maxKilobytes higher when you need more output in one call.
+Set timeoutSeconds higher when you need more time in one call.
+The pattern for slow work: one foreground call with a raised
+timeoutSeconds. The call waits, then returns the result.
+The anti-pattern: start the command with nohup or & in one call, then
+poll for its end with sleep loops in later calls. Do not do this.
+Each poll round only waits and adds cost. Keep the command in the
+foreground of one call and raise its timeoutSeconds instead.
+
+SESSION DIR
+
+The session dir is the directory of this one wisp session. It is
+not the current directory. Your tool commands start in the project directory.
+The session dir holds: wisp.jsonl, spill/, wisp.log, wisp.usage,
+wisp.modelcfg, wisp.run.json, and wisp.stream when a caller
+redirected the run stream there.
+wisp.jsonl is the record of truth for the session.
+wisp appends one commit to wisp.jsonl when a run exits.
+Do not edit wisp.jsonl by hand.
+wisp owns spill/. Do not write there.
+wisp.log holds the run log.
+wisp.usage holds the cumulative usage chunks.
+wisp.run.json holds the model and thinking settings.
+When an <environment> block opens your system prompt, its MODEL and
+THINKING lines hold the same settings. A missing THINKING line
+means the run sets no thinking; omit -t. Do not read wisp.run.json
+for them.
+wisp.modelcfg holds model entries with context size and cost data.
+
+TURN MODEL
+
+One wisp run reads one prompt from stdin and sends it to the model.
+wisp run prints raw "data:" SSE lines. Do not parse those lines.
+After a run, read state with these commands only:
+"render-past -d DIR" shows the session as formatted text.
+"response -d DIR" shows the final assistant message as plain text.
+"usage -d DIR" shows cost and token data for the run.
+Each tool call gets a {"wisp":"tool_call",...} data: line before wisp
+runs the call. The tool note follows the result. Read both before you
+decide.
+load_image takes a path and an optional resize flag. The default
+resize true fits the image into the default dimension and byte
+limits. resize false sends the file bytes unchanged.
+""" + "\n\n" + subagents_block()
+
+
+def subagents_block() -> str:
+    """The SUBAGENTS section of the wisp block: the delivery guard,
+    the laws, the recipes with -d, the no-export law, the
+    variations, and the open-endedness statement. Pure text, no world
+    input.
+    """
+    return """\
+SUBAGENTS
+
+This block carries the subagent laws. A session with no SUBAGENTS
+block in its system prompt must not start children. It must ask
+the operator to rebuild its prompt with --wisp.
+
+LAWS
+
+The parent law: give every child --parent with your session dir. A
+child without --parent is an orphan. "wisp ls --tree" and
+"wisp grep --tree" cannot see an orphan.
+
+The stream law: send child stdout to "$CHILD/wisp.stream".
+"wisp render-live" follows this exact path. A stream at any other
+path breaks that tool. The stream never goes into your tool
+result. Read the answer with "wisp response". Delete the stream
+after the read. The stream is temporary data. wisp.jsonl is the
+record of truth.
+
+The home rule: put every child artifact in the child session dir.
+These artifacts are the prompt file, the stream, and captured
+response text. Do not use /tmp.
+
+The symbol map: in the parent recipe, $CHILD names the child run
+dir. In the child session itself, WISP_SESSION_DIR names that same
+dir.
+
+A subagent is a child wisp session. You start it from the bash
+tool. The primary recipe:
+
+  CHILD="$(wisp new --name NAME -m MODEL --parent <session dir>)"
+  wisp run -d "$CHILD" --context-guard 70% > "$CHILD/wisp.stream" <<'EOF'
+  <the child's prompt>
+  EOF
+  wisp response -d "$CHILD"
+  rm "$CHILD/wisp.stream"
+
+A live view, in another terminal:
+  tail -f "$CHILD/wisp.stream" | wisp render-live
+A past view stays available through "wisp render-past -d <child>"
+after the run. The prompt-file recipe, the escape from heredoc
+quoting:
+
+  CHILD="$(wisp new --name NAME -m MODEL --parent <session dir>)"
+  cat > "$CHILD/prompt.txt" <<'EOF'
+  <the child's prompt>
+  EOF
+  wisp run -d "$CHILD" --context-guard 70% < "$CHILD/prompt.txt" > "$CHILD/wisp.stream"
+  wisp response -d "$CHILD"
+  rm "$CHILD/wisp.stream"
+
+The persona recipe, a child that runs one skill as its system
+prompt:
+
+  CHILD="$(wisp new --name NAME -m MODEL -t THINKING
+           --parent <session dir>
+           --env-in-system-prompt
+           -s <(wisp build-system-prompt --wisp --skills --agents-md
+                < <(wisp skill read SKILL)))"
+  wisp run -d "$CHILD" --context-guard 70% > "$CHILD/wisp.stream" <<'EOF'
+  <the child's prompt>
+  EOF
+  wisp response -d "$CHILD"
+  rm "$CHILD/wisp.stream"
+
+"wisp skill read SKILL" prints the skill body, frontmatter
+stripped, in a <skill> block. Feed it to "wisp build-system-prompt"
+on stdin. "wisp build-system-prompt --wisp --skills --agents-md"
+assembles the wisp block, the AGENTS.md chain, the skills catalog,
+and stdin into the persona file. The -s argument is a file path,
+never the persona content. Use the process substitution form as
+shown. "--env-in-system-prompt" prepends
+the child's own <environment> block, so the child learns its run
+dir, its MODEL, and its THINKING. Use it on every persona child.
+By default, give the child your own MODEL and THINKING, unless the
+user provides them. 70% is the default guard limit; change it when
+the task needs it.
+
+A child run that the guard stops exits with code 75. Its finished
+rounds stay committed. A guard stop lands after a tool round, so
+most times the last record is not an answer and wisp response shows
+nothing. Read the end of the child session with wisp render-past
+-d <child dir> | tail -n <n>. Two options continue the child:
+- Raise the limit: wisp continue -d <child dir> --context-guard
+  LIMIT, with a limit higher than before.
+- Summarize the session by hand and start a new run with the
+  summary text as the prompt. Wisp ships no summarizing prompt, so
+  use one of your own: wisp run -d <child dir> < summary.md.
+
+The no-export law: the recipes never export WISP_SESSION_DIR. Every call
+names its session dir with -d. An export dies with the shell process; a
+later bare wisp command then binds to the parent's own WISP_SESSION_DIR
+and runs the parent's session.
+
+The parent session dir comes from the SESSION DIR line of the environment
+block. wisp new prints the child session dir path; the shell variable
+carries it to the -d argument of wisp run and wisp response. A child
+may take a persona file with -s SYSFILE. Read the cost with
+"wisp usage". Run several children in parallel: start each run
+with & and end the same call with wait. Raise timeoutSeconds for
+that call. Give each child run --context-guard, so a child that
+overruns its context stops itself. Name children with --name for
+later retrieval.
+"wisp ls --tree" and "wisp grep --tree" cover one session subtree
+through the children references.
+
+The invariants:
+- --parent on every "wisp new" for a child.
+- -d on every call.
+- Child stdout to "$CHILD/wisp.stream".
+- "wisp response -d" for the answer.
+- Delete the stream after the read.
+- Child artifacts in the child session dir.
+- Never export WISP_SESSION_DIR.
+
+The recipe is open-ended. The shape is open; the invariants are not.
+Keep all invariants in each variant of the recipe. You decide the
+shape: one child or many, sequential or parallel, prompted inline
+or from a file. Nesting depth is unlimited by wisp. wisp spawns
+nothing on its own."""
+
+
+def build_system_prompt(world: World, opts: Any) -> int:
+    """Concatenate the wisp block, AGENTS.md files, skill summaries,
+    and stdin."""
+    if not (opts.wisp or opts.agents_md or opts.skills):
+        fail(world, "wisp build-system-prompt: pass --agents-md or --skills")
+    blocks = []
+    if opts.wisp:
+        blocks.append(xml_block("wisp", None, wisp_block()))
+    if opts.agents_md:
+        blocks.extend(
+            xml_block("agents-md", p, world.get("fs").read_text(p))
+            for p in agents_md_files(world)
+        )
+    if opts.skills:
+        blocks.append(xml_block("skills", None, "%s\n\n%s" % (
+            skills_preamble(), "\n".join(
+                "%s: %s (%s)" % (n, d, p)
+                for n, d, p in collect_skills(world)))))
+    inline = ""
+    if not world.get("stdin").is_interactive():
+        inline = world.get("stdin").read_text()
+    if inline.strip():
+        blocks.append(xml_block("stdin", None, inline))
+    if not blocks:
+        return 0
+    world.get("stdout").write("\n\n".join(blocks) + "\n")
+    return 0
+
+
+class SignalExit(BaseException):
+    """Graceful shutdown: SIGTERM or SIGHUP reached `wisp run`.
+
+    The handler raises this so the interpreter unwinds the run loop;
+    the exit commit in the finally block flushes what the run holds to
+    wisp.jsonl. BaseException, like KeyboardInterrupt and SystemExit,
+    keeps broad `except Exception` handlers - the model-info fetch,
+    tool runs - from swallowing it. main turns it into exit code
+    128 + signum, the shell convention."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.signum = signum
+
+
+class ContextGuardExit(Exception):
+    """The context guard fired: context use crossed the limit.
+
+    loop_rounds raises it at a round boundary, after the round
+    committed. run_prepared catches it, writes the stop line, and
+    exits GUARD_EXIT through the normal flush path, so every
+    finished round stays on disk and the session stays resumable.
+    An Exception, not a BaseException: only run_prepared must catch
+    it, and main's crash handler must never see it."""
+
+    def __init__(self, round_no: int, used: int, guard: dict):
+        super().__init__("round %s used %s tokens"
+                         % (round_no, used))
+        self.round_no = round_no
+        self.used = used
+        self.guard = guard
+
+
+def install_exit_signals(world: World) -> None:
+    """Turn SIGTERM and SIGHUP into SignalExit raises for `wisp run`.
+
+    The raise unwinds through the run loop's finally block, so the
+    exit commit flushes every completed round; a kill then loses at
+    most the in-flight round. SIGINT keeps its default
+    KeyboardInterrupt path, which unwinds the same way and exits 130.
+    Install fails silently off the main thread or on a platform
+    without the signal; the default kill behavior then applies."""
+
+    def raise_exit(signum: int, frame: Any) -> None:
+        raise SignalExit(signum)
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, raise_exit)
+        except (ValueError, OSError):
+            pass
+
+
+def load_session_state(world: World, opts: Any) -> tuple:
+    """Bind the session dir, load its setup and its committed records.
+
+    Shared by run and continue: model and thinking come from
+    wisp.run.json, the records and the commit point from
+    wisp.jsonl. The commit point lands in world, where every commit
+    advances it, so a record writes exactly once whatever exit path
+    runs."""
+    world.set("sessiondir", opts.sessiondir)
+    setup = world.get("session").load_run_setup(opts.sessiondir)
+    world.set("model", setup["model"])
+    world.set("thinking", setup.get("thinking"))
+    records, committed = world.get("session").load_events()
+    world.set("committed", committed)
+    return setup, records
+
+
+def run_prepared(world: World, records: list, setup: dict) -> int:
+    """Run the round loop on a prepared conversation, flush at exit.
+
+    The shared core of `wisp run` and `wisp continue`: install the
+    exit signals, run loop_rounds with the segment's restored round
+    counter, and let the exit commit flush whatever no round
+    committed. SIGTERM and SIGHUP raise SignalExit; the unwinding
+    reaches the exit commit, which flushes the same tail, and main
+    exits 128 + signum. A context guard that fired at a round
+    boundary returns GUARD_EXIT through the same exit commit. After
+    the flush, warn_undelivered_steer warns
+    when the steer inbox still holds messages the run never injected."""
+    install_exit_signals(world)
+    safe_log(world, "run", "start", "pid=%s" % os.getpid(),
+             "model=%s" % world.get("model"),
+             "api=%s" % (world.get("env").get("WISP_LLM_API") or "openai-chat"))
+    try:
+        world.get("session").refresh_model_cfg()
+        try:
+            loop_rounds(world, records, max_rounds_of(world),
+                        world.get("context_guard"))
+            return 0
+        except ContextGuardExit as exc:
+            guard_stop_line(world, exc)
+            return GUARD_EXIT
+    finally:
+        flush_records(world, records)
+        warn_undelivered_steer(world)
+
+
+def run_agent_loop(world: World, opts: Any) -> int:
+    """`wisp run`: read the prompt from stdin and run the rounds.
+
+    The prompt becomes the user record that opens the turn's segment.
+    Each completed round commits to wisp.jsonl when its tail is a
+    stable boundary: a kill loses at most the current round; the
+    discard rule in load_events covers the tail it leaves. MAX_TURNS
+    exhaustion leaves the in-progress segment raw on disk. A steer
+    inbox an earlier run left behind drains
+    first - steer_intake - so its messages join the conversation as
+    steered user records before the new prompt."""
+    setup, records = load_session_state(world, opts)
+    world.set("context_guard",
+              context_guard_of(world, getattr(opts, "context_guard", None)))
+    steer_intake(world, records)
+    prompt = world.get("stdin").read_text()
+    if not prompt.strip():
+        fail(world, "no user prompt on stdin")
+    user_rec = {"type": "user", "content": prompt}
+    attachments = load_attachments(world, getattr(opts, "attach", None))
+    if attachments:
+        user_rec["attachments"] = attachments
+    records.append(user_rec)
+    return run_prepared(world, records, setup)
+
+
+def continue_agent_loop(world: World, opts: Any) -> int:
+    """`wisp continue`: finish an open segment without a new prompt.
+
+    Never appends a user prompt - `wisp run` owns that behavior - so
+    the killed segment's records stay in the conversation as plain
+    history. The tail of wisp.jsonl decides. An open tail - a user
+    prompt or tool records - runs the loop directly on the loaded
+    conversation. A stop-finish assistant tail - a finished plain
+    run - and an empty log fail fast and name `wisp run`. Reads no
+    stdin."""
+    setup, records = load_session_state(world, opts)
+    world.set("context_guard",
+              context_guard_of(world, getattr(opts, "context_guard", None)))
+    if not records or records[-1].get("type") == "system":
+        fail(world, "wisp continue: nothing to continue in %s"
+                    % opts.sessiondir)
+    tail = records[-1]
+    if tail.get("type") == "assistant" and not any(
+            block.get("type") == "tool_call"
+            for block in tail.get("output") or []):
+        fail(world, "wisp continue: the run finished;"
+                    " use `wisp run` with a prompt")
+    elif tail.get("type") not in ("user", "tool"):
+        fail(world, "wisp continue: nothing to continue in %s"
+                    % opts.sessiondir)
+    return run_prepared(world, records, setup)
+
+
+def steer_command(world: World, opts: Any) -> int:
+    """`wisp steer`: queue one steering message for the session's runs.
+
+    The message - the whole stdin text, its trailing newline off -
+    lands as one JSON line in <DIR>/wisp.steer.inbox, appended when
+    the file holds earlier messages, so messages stack in order. A
+    live `wisp run` drains the inbox at each round boundary and turns
+    each line into one steered user record; a run that ends with
+    messages still waiting warns on stderr, and the next `wisp run`
+    injects them before its prompt. No lock, no liveness check: the
+    inbox write is the whole command, so it works on any session dir
+    and never disturbs a running loop."""
+    world.set("sessiondir", opts.sessiondir)
+    message = world.get("stdin").read_text()
+    if not message.strip():
+        fail(world, "no steer message on stdin")
+    fs = world.get("fs")
+    inbox = opts.sessiondir + "/" + STEER_INBOX
+    fs.append_text(inbox, json.dumps(
+        {"content": message.rstrip("\n")}, ensure_ascii=False) + "\n")
+    world.get("session").log("steer", "queued=1")
+    return 0
+
+
+def max_rounds_of(world: World) -> int:
+    """The loop's round cap: WISP_LLM_MAX_TURNS, else DEFAULT_MAX_TURNS."""
+    raw = world.get("env").get("WISP_LLM_MAX_TURNS", str(DEFAULT_MAX_TURNS))
+    try:
+        return int(raw)
+    except ValueError:
+        fail(world, "WISP_LLM_MAX_TURNS is not a number: %s" % raw)
+
+
+def steer_intake(world: World, records: list) -> int:
+    """Drain the steer inbox at one round boundary; the count of
+    steered records appended.
+
+    One atomic rename - wisp.steer.inbox to a consumed name - takes
+    the whole mailbox, then the consumed copy is read: a `wisp steer`
+    append that lands after the rename starts a fresh inbox, so no
+    message is lost and none is read twice. Each complete JSON line
+    becomes one steered user record, marked wisp_steered: a plain user
+    record on the wire that never opens a segment and never resets
+    the round counter. A line that fails json.loads is a mid-append
+    kill remnant; it is skipped, not injected. The records commit
+    before the loop runs on - flush_records - so a kill after the
+    drain loses nothing: the steered record is on disk and a later
+    `wisp continue` resumes it. Each injection writes one
+    `data: {"wisp":"steer",...}` stream line, so a live `wisp render-live`
+    shows the steering; one steer line lands in wisp.log."""
+    fs = world.get("fs")
+    inbox = world.get("sessiondir") + "/" + STEER_INBOX
+    if not fs.exists(inbox):
+        return 0
+    consumed = "%s.%s" % (inbox, world.get("rng").token(8))
+    try:
+        fs.rename(inbox, consumed)
+    except OSError:
+        return 0
+    try:
+        text = fs.read_text(consumed)
+    except OSError:
+        text = ""
+    count = 0
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        content = (message.get("content")
+                   if isinstance(message, dict) else None)
+        if not isinstance(content, str) or not content.strip():
+            continue
+        records.append({"type": "user", "content": content,
+                        "wisp_steered": True})
+        world.get("stdout").write("data: %s\n" % json.dumps(
+            {"wisp": "steer", "content": content}, ensure_ascii=False))
+        count += 1
+    fs.remove(consumed)
+    if count:
+        flush_records(world, records)
+        world.get("session").log("steer", "injected=%s" % count)
+    return count
+
+
+def warn_undelivered_steer(world: World) -> None:
+    """Warn when the run ended with steer messages still waiting.
+
+    The mandatory end-of-run warning: messages that queued after the
+    last round boundary never reached the model. Counts the complete
+    JSON lines in the inbox and warns once on stderr with the count
+    and the inbox path. The inbox stays in place - the next `wisp run`
+    drains it before its prompt, so no message is lost."""
+    fs = world.get("fs")
+    inbox = world.get("sessiondir") + "/" + STEER_INBOX
+    if not fs.exists(inbox):
+        return
+    try:
+        text = fs.read_text(inbox)
+    except OSError:
+        return
+    count = 0
+    for line in text.split("\n"):
+        if not line.strip():
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(message, dict)
+                and isinstance(message.get("content"), str)
+                and message["content"].strip()):
+            count += 1
+    if count:
+        world.get("stderr").write(
+            "wisp: warning: %s steer message(s) never injected; they"
+            " wait in %s; the next `wisp run` injects them before"
+            " its prompt\n" % (count, inbox))
+
+
+def turn_has_content(result: dict) -> bool:
+    """A turn can end the segment only when it holds a tool-call
+    block or a text block with non-empty text.
+
+    Reasoning alone does not count. A stop that carries only
+    thinking is the model ending its turn with no answer: the
+    kept-context format requires a text message, so accepting a
+    reasoning-only stop commits an empty final record and the
+    segment ends silently mid-work (verified 2026-10-07: four
+    premature segment ends, wisp.jsonl record with
+    finish=stop blocks=[])."""
+    for block in result["assistant"].get("output") or []:
+        kind = block.get("type")
+        if kind == "tool_call":
+            return True
+        if kind == "text" and (block.get("text") or "").strip():
+            return True
+    return False
+
+
+def turn_with_degenerate_guard(world: World, llm: Any, records: list,
+                               round_no: int) -> dict:
+    """One llm.turn guarded against a textless turn end.
+
+    A turn ends only when its record carries a tool-call block or a
+    text block with content: tool calls run their tools, text closes
+    the turn. A result that ends with neither - a stop after
+    thinking only, an empty completion whatever usage it carries, or
+    an endpoint stream that carried no completion payload at all -
+    is not a turn end: the record is appended when it holds blocks,
+    so the thinking rides the next request and survives on disk, and
+    the model is asked again. Every retry appends RETRY_NUDGE as a
+    user record, so the next attempt is a new request and not a
+    plain resend of the request that just came back empty. The guard
+    allows at most WISP_DEGENERATE_RETRY such textless attempts
+    (default DEGENERATE_ATTEMPTS) and then fails the run with one
+    degenerate log line, so no empty final record reaches the jsonl.
+    An empty-stream note from sse_stream rides the retry and
+    degenerate log lines and the failure text. Each attempt logs
+    its own request/response pair because every retry is a new
+    request."""
+    session = world.get("session")
+    try:
+        bound = max(1, int(world.get("env").get("WISP_DEGENERATE_RETRY")))
+    except (TypeError, ValueError):
+        bound = DEGENERATE_ATTEMPTS
+    for attempt in range(bound):
+        world.set("stream_note", "")
+        session.log("request", "model=%s" % world.get("model"),
+                    "api=%s" % (world.get("env").get("WISP_LLM_API")
+                                or "openai-chat"),
+                    "effort=%s" % (world.get("thinking") or "none"),
+                    "round=%s" % round_no)
+        result = llm.turn(records)
+        note = world.get("stream_note") or ""
+        session.log("response", "round=%s" % round_no,
+                    "finish_reason=%s" % result["finish_reason"])
+        session.log("cache", "round=%s" % round_no,
+                    "cached_tokens=%s" % result["cached_tokens"])
+        if result["finish_reason"] == "tool_calls" or turn_has_content(result):
+            return result
+        kinds = ",".join(block.get("type") or "?"
+                         for block in result["assistant"].get("output")
+                         or []) or "none"
+        appended = False
+        if result["assistant"].get("output"):
+            # Not a turn end: the record stays. The thinking rides
+            # the next request and survives on disk.
+            records.append(result["assistant"])
+            appended = True
+        if attempt < bound - 1:
+            records.append({"type": "user", "content": RETRY_NUDGE,
+                            "wisp_retry": True})
+            flush_records(world, records)
+            fields = ["round=%s" % round_no,
+                      "finish_reason=%s" % result["finish_reason"],
+                      "blocks=%s" % kinds,
+                      "usage_chunks=%s" % len(
+                          result["assistant"].get("usage") or [])]
+            if note:
+                fields.append("note=%s" % note)
+            session.log("retry", *fields)
+            continue
+        if appended:
+            flush_records(world, records)
+        fields = ["round=%s" % round_no,
+                  "finish_reason=%s" % result["finish_reason"],
+                  "blocks=%s" % kinds, "usage_chunks=0"]
+        if note:
+            fields.append("note=%s" % note)
+        session.log("degenerate", *fields)
+        cause = ("; %s" % note) if note else ""
+        fail(world, "round %s ended with an empty or textless %s"
+                    " response - no text and no tool calls -"
+                    " after %s attempts (WISP_DEGENERATE_RETRY)%s;"
+                    " the finished rounds stay on disk"
+             % (round_no, result["finish_reason"] or "<none>", bound, cause))
+    raise AssertionError("unreachable: the guard returns or fails")
+
+
+# --- context guard ---------------------------------------------------------------
+
+def parse_context_guard(world: World, raw: str) -> dict:
+    """Parse one --context-guard value.
+
+    '70%' is a percent of the model's context window, 1 to 99.
+    '150k', '1m' and a plain number are token limits; k and m
+    multiply by 1000 and 1000000. Returns the spec
+    {"kind": "percent"|"tokens", "value": int}; every other form
+    fails with one line that names the valid forms."""
+    text = str(raw).strip()
+    body, percent = text, False
+    if body.endswith("%"):
+        body, percent = body[:-1], True
+    mult = 1
+    if body and body[-1] in "kKmM":
+        if percent:
+            fail(world, "--context-guard %s: a percent takes no k or m"
+                        " suffix" % text)
+        mult = 1000 if body[-1] in "kK" else 1000000
+        body = body[:-1]
+    if not (body.isascii() and body.isdigit()):
+        fail(world, "--context-guard %s: use a percent like 70%%, a"
+                    " token count like 150k or 1m, or a plain token"
+                    " number like 200000" % text)
+    value = int(body) * mult
+    if percent and not 1 <= value <= 99:
+        fail(world, "--context-guard %s: the percent needs a value"
+                    " from 1 to 99" % text)
+    if not percent and value <= 0:
+        fail(world, "--context-guard %s: the token limit needs a"
+                    " positive number" % text)
+    return {"kind": "percent" if percent else "tokens", "value": value}
+
+
+def context_guard_of(world: World, raw) -> dict | None:
+    """The resolved context guard for one run, None without the flag.
+
+    Percent mode needs the model's context window from the session's
+    wisp.modelcfg, so the guard fails at start - before the first
+    round - when the entry or the window is missing: a guard the
+    caller asked for must not turn itself off in silence, and the
+    error names the token form that needs no modelcfg. Token mode
+    needs no modelcfg and carries no window.
+
+    A fresh session has no wisp.modelcfg until a run writes it, and
+    the run writes it after this call, so percent mode fetches the
+    modelcfg itself first - the same best-effort /v1/model/info call
+    refresh_model_cfg makes - and fails only when the fetch leaves
+    no window either."""
+    if raw is None:
+        return None
+    spec = parse_context_guard(world, raw)
+    if spec["kind"] != "percent":
+        return spec
+    path = world.get("sessiondir") + "/wisp.modelcfg"
+    cfg = read_model_cfg(world, path, world.get("model"))
+    window = int(cfg.get("context") or 0) if cfg else 0
+    if window <= 0:
+        world.get("session").refresh_model_cfg()
+        cfg = read_model_cfg(world, path, world.get("model"))
+        window = int(cfg.get("context") or 0) if cfg else 0
+    if window <= 0:
+        fail(world, "--context-guard %s%%: no context window for model"
+                    " %s in %s/wisp.modelcfg; use a token limit like"
+                    " --context-guard 150k"
+             % (spec["value"], world.get("model"),
+                world.get("sessiondir")))
+    spec["window"] = window
+    return spec
+
+
+def check_context_guard(world: World, records: list, round_no: int,
+                        guard: dict | None) -> None:
+    """Stop the run when context use crossed the guard limit.
+
+    Runs at a round boundary: the round's records committed, the next
+    llm.turn not yet sent. The measure is the prompt_tokens of the
+    last assistant record - the size of the request that closed the
+    round, so it lags one round behind the next request and holds
+    none of the stopped round's tool results. A round that reports no
+    usage skips the check. Raises ContextGuardExit; run_prepared
+    turns it into exit GUARD_EXIT through the normal flush path."""
+    if guard is None:
+        return
+    for rec in reversed(records):
+        if rec.get("type") != "assistant":
+            continue
+        chunks = rec.get("usage") or []
+        if not chunks:
+            return
+        chunk = chunks[-1]
+        usage = (chunk.get("usage") if isinstance(chunk.get("usage"), dict)
+                 else chunk)
+        used = int(usage.get("prompt_tokens") or 0)
+        if guard["kind"] == "percent":
+            window = int(guard.get("window") or 0)
+            if used * 100 >= guard["value"] * window:
+                raise ContextGuardExit(round_no, used, guard)
+        elif used >= guard["value"]:
+            raise ContextGuardExit(round_no, used, guard)
+        return
+
+
+def guard_stop_line(world: World, exc: ContextGuardExit) -> None:
+    """One stderr line and one wisp.log line for a guard stop.
+
+    The line states the session dir, the round, the used tokens, the
+    window and the percent when known, and the limit. It names the
+    three next steps - run, steer, do nothing - because the harness
+    stops and the caller chooses. Token mode reads the window
+    best-effort for the line only; the stop never depends on it."""
+    guard = exc.guard
+    window = int(guard.get("window") or 0)
+    if window <= 0:
+        cfg = read_model_cfg(world,
+                             world.get("sessiondir") + "/wisp.modelcfg",
+                             world.get("model"))
+        window = int(cfg.get("context") or 0) if cfg else 0
+    if guard["kind"] == "percent":
+        limit = "%s%% (%s tokens)" % (
+            guard["value"],
+            fmt_tokens(guard["value"] * window // 100))
+    else:
+        limit = "%s tokens" % fmt_tokens(guard["value"])
+    context = ("used %s of %s tokens (%.1f%%)"
+               % (fmt_tokens(exc.used), fmt_tokens(window),
+                  exc.used * 100.0 / window)) if window > 0 else (
+        "used %s tokens" % fmt_tokens(exc.used))
+    world.get("stderr").write(
+        "wisp: context guard: %s stopped at round %s: %s, limit %s;"
+        " next: `wisp run` with a new prompt, `wisp steer` with a"
+        " message, or do nothing\n"
+        % (world.get("sessiondir"), exc.round_no, context, limit))
+    safe_log(world, "guard", "round=%s" % exc.round_no,
+             "used=%s" % exc.used, "window=%s" % window,
+             "kind=%s" % guard["kind"], "value=%s" % guard["value"])
+
+
+def loop_rounds(world: World, records: list, max_rounds: int,
+                guard: dict | None = None) -> None:
+    """The model round loop of `wisp run`.
+
+    One loop step is one round: one llm.turn and, when the model ends
+    with tool_calls, one tool execution. Each turn passes through
+    turn_with_degenerate_guard, which keeps every textless result -
+    thinking preserved, record appended, request re-sent - and fails
+    the run after WISP_DEGENERATE_RETRY attempts with no text, so a
+    broken endpoint stream can no longer end a run silently.
+    Tool-call blocks decide the round, not the finish marker: a turn
+    that holds tool calls runs its tools whatever the finish says,
+    because some endpoints end a tool-bearing stream with stop or
+    with no finish marker at all. A turn with no finish marker never
+    ends the run: the loop keeps the round and asks again. The loop
+    mutates records in place and commits each round whose tail is a
+    stable boundary, every commit advances the shared commit point in
+    world, so the exit commit at run exit appends only what no round
+    committed. Each round opens with steer_intake: the steer inbox
+    drains at the boundary the last round's flush left, so a queued
+    steering message joins the conversation as a user record before
+    the next llm.turn. A context guard, when the run carries one,
+    checks each committed round boundary before the next llm.turn:
+    check_context_guard raises ContextGuardExit when the last round's
+    prompt tokens crossed the limit, and the unwind commits through
+    run_prepared's exit commit and exits GUARD_EXIT. MAX_TURNS
+    exhaustion leaves the in-progress segment raw on disk."""
+    session, llm, tools = world.get("session"), world.get("llm"), world.get("tools")
+    for round_no in range(1, max_rounds + 1):
+        steer_intake(world, records)
+        result = turn_with_degenerate_guard(
+            world, llm, records, round_no)
+        assistant = result["assistant"]
+        records.append(assistant)
+        calls = [b for b in assistant["output"] if b["type"] == "tool_call"]
+        if calls:
+            # Tool-call blocks decide the round, not the finish marker.
+            # Some endpoints end the stream with stop, or with no
+            # finish marker at all, while the model asked for tools.
+            # The turn is not over: run the tools and keep going.
+            records.extend(tools.execute(calls))
+            flush_records(world, records)
+            check_context_guard(world, records, round_no, guard)
+            continue
+        if result["finish_reason"] == "":
+            # The stream carried no finish marker. This is not a turn
+            # end. Keep the round on disk and ask again.
+            flush_records(world, records)
+            check_context_guard(world, records, round_no, guard)
+            continue
+        if result["finish_reason"] != "tool_calls":
+            flush_records(world, records)
+            return
+        fail(world, "round %s finished with tool_calls but holds no"
+                    " tool call block" % round_no)
+    world.get("stderr").write(
+        "wisp: warning: reached WISP_LLM_MAX_TURNS (%s); terminating\n" % max_rounds)
+
+
+@contextlib.contextmanager
+def commit_guard():
+    """Hold SIGINT, SIGTERM and SIGHUP off for the commits inside.
+
+    A signal that lands inside a commit stays pending until the block
+    lifts and its raise lands after the commit-point move, so no
+    signal splits a commit or makes a later commit write a batch that
+    is on disk already. Off the main thread, or on a platform without
+    the mask, the guard does nothing; the default kill behavior then
+    applies."""
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK,
+                               {signal.SIGINT, signal.SIGTERM,
+                                signal.SIGHUP})
+        blocked = True
+    except (AttributeError, OSError, ValueError):
+        blocked = False  # no mask on this platform: commit unguarded
+    try:
+        yield
+    finally:
+        if blocked:
+            signal.pthread_sigmask(signal.SIG_UNBLOCK,
+                                   {signal.SIGINT, signal.SIGTERM,
+                                    signal.SIGHUP})
+
+
+def flush_records(world: World, records: list) -> None:
+    """Commit the records past the commit point, then advance it.
+
+    The commit point - the count of records already on disk - lives in
+    world, one number shared by the round loop and the exit commit, so
+    a record writes exactly once: the loop advances the point after
+    each per-round commit and the exit commit at run exit appends only
+    what no round committed. The caller ensures the tail ends at a
+    stable boundary: no assistant record whose tool records are
+    missing. commit_guard holds the signals
+    off for the write and the advance."""
+    with commit_guard():
+        world.get("session").commit_events(
+            records[world.get("committed"):])
+        world.set("committed", len(records))
+
+
+# --- steer inbox ----------------------------------------------------------------
+
+STEER_INBOX = "wisp.steer.inbox"
+"""The steer mailbox: <sessiondir>/wisp.steer.inbox. `wisp steer`
+appends one JSON line per message; a live run renames the file away at
+each round boundary and turns its lines into steered user records."""
+
+STEER_TAG = (
+    "Steering message added mid-run. It is not the turn prompt and"
+    " it does not open a segment."
+)
+"""The one-line wire tag build_request puts before a steered user
+message content. The stored record keeps the user's exact text, so
+render and grep stay unchanged. The tag gives
+the model the fact the code already has: the message is steering,
+not the turn prompt, and it does not open a segment."""
+
+
+def parse_records(text: str) -> list:
+    """Parse one stored jsonl text into records. A line that fails
+    json.loads is a mid-commit kill remnant; it is skipped."""
+    records = []
+    for line in text.split("\n"):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
+
+
+def final_text_of(records: list) -> str | None:
+    """The final text message of a turn: the text of its last
+    `assistant` record. None when the record is absent, carries tool
+    calls, or holds no text."""
+    assistants = [rec for rec in records if rec.get("type") == "assistant"]
+    if not assistants:
+        return None
+    output = assistants[-1].get("output") or []
+    if any(block.get("type") == "tool_call" for block in output):
+        return None
+    text = "".join(block.get("text", "") for block in output
+                   if block.get("type") == "text").strip()
+    return text or None
+
+
+def render_records(world: World, opts: Any) -> int:
+    """Render the wisp run's stdout stream from stdin as plain text."""
+    renderer = Renderer(world)
+    for line in world.get("stdin").lines():
+        renderer.render_line(line)
+    renderer.finish()
+    return 0
+
+
+def render_past(world: World, opts: Any) -> int:
+    """Render a past run: read <sessiondir>/wisp.jsonl and feed each stored
+    record to the renderer as the same `data:` payload the live stream
+    carried. Read-only: a broken line is skipped, a dangling tool_call
+    renders without its result."""
+    world.set("sessiondir", opts.sessiondir)
+    fs = world.get("fs")
+    path = opts.sessiondir + "/wisp.jsonl"
+    records = parse_records(fs.read_text(path))
+    renderer = Renderer(world)
+    for line in records_to_stream(records):
+        renderer.render_line(line)
+    renderer.finish()
+    return 0
+
+
+def response_command(world: World, opts: Any) -> int:
+    """`wisp response`: print the run's final assistant message as text.
+
+    Single-shot and read-only: reads <DIR>/wisp.jsonl once, finds the
+    final assistant message, prints its text to stdout. No backend
+    traffic, no writes to the session dir. Run with -d DIR, or set
+    WISP_SESSION_DIR; without both, wisp response fails.
+    """
+    world.set("sessiondir", opts.sessiondir)
+    fs = world.get("fs")
+    records = parse_records(fs.read_text(opts.sessiondir + "/wisp.jsonl"))
+    text = final_text_of(records)
+    if text is None:
+        fail(world, "wisp response: no final assistant message in %s"
+                    % opts.sessiondir)
+    world.get("stdout").write(text + "\n")
+    return 0
+
+
+def usage_command(world: World, opts: Any) -> int:
+    """Print the run's cumulative usage statistics as one line.
+
+    Reads <DIR>/wisp.usage once, the model from <DIR>/wisp.run.json,
+    and the model's entry from <DIR>/wisp.modelcfg. Single-shot: no
+    following, no live data, no backend traffic. Missing config
+    renders the <noprice>/<nocontext> placeholders.
+    """
+    world.set("sessiondir", opts.sessiondir)
+    fs = world.get("fs")
+    path = opts.sessiondir + "/wisp.usage"
+    if not fs.exists(path):
+        fail(world, "no wisp.usage in session dir: %s" % opts.sessiondir)
+    model = world.get("session").load_run_setup(opts.sessiondir)["model"]
+    chunks = read_usage_chunks(world, path)
+    cfg = read_model_cfg(world, opts.sessiondir + "/wisp.modelcfg", model)
+    world.get("stdout").write(usage_line(chunks, cfg) + "\n")
+    return 0
+
+
+def read_usage_chunks(world: World, path: str) -> dict:
+    """Fold wisp.usage into one state dict; skip broken lines.
+
+    net = prompt - cached - cache_write;
+    last_total is the last chunk's total_tokens, not a sum. Lines
+    written before the data:-prefix removal still parse.
+    """
+    state = {"turns": 0, "net": 0, "cache": 0, "write": 0,
+             "out": 0, "reasoning": 0, "last_total": 0}
+    for line in world.get("fs").read_text(path).split("\n"):
+        text = line[len("data: "):] if line.startswith("data: ") else line
+        try:
+            chunk = json.loads(text)
+        except ValueError:
+            continue
+        if not isinstance(chunk, dict):
+            continue
+        usage = chunk.get("usage") if isinstance(chunk.get("usage"), dict) else chunk
+        details = usage.get("prompt_tokens_details") or {}
+        out_details = usage.get("completion_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0)
+        write = int(details.get("cache_write_tokens") or 0)
+        prompt = int(usage.get("prompt_tokens") or 0)
+        state["net"] += max(0, prompt - cached - write)
+        state["cache"] += cached
+        state["write"] += write
+        state["out"] += int(usage.get("completion_tokens") or 0)
+        state["reasoning"] += int(out_details.get("reasoning_tokens") or 0)
+        state["turns"] += 1
+        state["last_total"] = int(usage.get("total_tokens") or 0)
+    return state
+
+
+def read_model_cfg(world: World, path: str, model: str) -> dict | None:
+    """The model's wisp.modelcfg entry, or None when the file or the
+    entry is missing or broken. Best effort, like refresh_model_cfg."""
+    fs = world.get("fs")
+    if not fs.exists(path):
+        return None
+    try:
+        table = json.loads(fs.read_text(path))
+    except ValueError:
+        return None
+    if not isinstance(table, dict) or not isinstance(table.get(model), dict):
+        return None
+    return table[model]
+
+
+def fmt_tokens(n: int) -> str:
+    """The token format: int, 1-dec k, rounded k, 1-dec M, M."""
+    if n < 1000:
+        return str(n)
+    if n < 10000:
+        return "%.1fk" % (n / 1000)
+    if n < 1000000:
+        return "%dk" % round(n / 1000)
+    if n < 10000000:
+        return "%.1fM" % (n / 1000000)
+    return "%dM" % round(n / 1000000)
+
+
+def usage_line(chunks: dict, cfg: dict | None) -> str:
+    """One line, modeline style minus the cache-hit rate:
+    in {net} out {out} ${cost} {used}/{window} {pct}%"""
+    cost = "<noprice>"
+    context = "<nocontext>"
+    if cfg:
+        if all(k in cfg for k in ("input", "output", "cacheRead", "cacheWrite")):
+            cost = "$%.3f" % ((chunks["net"] * (cfg["input"] or 0)
+                               + chunks["cache"] * (cfg["cacheRead"] or 0)
+                               + chunks["write"] * (cfg["cacheWrite"] or 0)
+                               + chunks["out"] * (cfg["output"] or 0)) / 1000000)
+        window = int(cfg.get("context") or 0)
+        if window > 0:
+            pct = chunks["last_total"] / window * 100
+            context = "%s/%s %.1f%%" % (fmt_tokens(chunks["last_total"]),
+                                        fmt_tokens(window), pct)
+    return "in %s out %s %s %s" % (fmt_tokens(chunks["net"]),
+                                   fmt_tokens(chunks["out"]), cost, context)
+
+
+# --- ls and grep ----------------------------------------------------------------
+
+def scope_paths(world: World, opts: Any) -> list:
+    """The session dirs of the scope: the project listdir by default, the
+    registry roots under --global, the one subtree under --tree."""
+    if opts.tree:
+        return tree_sessions(world, opts.sessiondir)
+    if opts.search_global:
+        return global_sessions(world)
+    return session_dirs(world, sessions_root(world))
+
+
+def session_dirs(world: World, root: str) -> list:
+    """The session dirs under one sessions root: every dir that holds
+    wisp.jsonl. A missing or unreadable root yields no dirs."""
+    fs = world.get("fs")
+    try:
+        entries = fs.listdir(root)
+    except OSError:
+        return []
+    out = []
+    for name in entries:
+        path = os.path.join(root, name)
+        if fs.isdir(path) and fs.exists(os.path.join(path, "wisp.jsonl")):
+            out.append(path)
+    return out
+
+
+def global_sessions(world: World) -> list:
+    """The sessions of every registered project: every symlink in the
+    registry root resolves to one sessions root.
+    Entries that are not symlinks, links that resolve to a missing
+    dir, and a missing registry root contribute nothing."""
+    fs = world.get("fs")
+    out = []
+    state = state_root(world)
+    try:
+        entries = fs.listdir(state)
+    except OSError:
+        return out
+    for entry in entries:
+        link = os.path.join(state, entry)
+        if not fs.islink(link):
+            continue
+        target = fs.readlink(link)
+        if not os.path.isabs(target):
+            target = os.path.join(state, target)
+        if fs.isdir(target):
+            out.extend(session_dirs(world, target))
+    return out
+
+
+def tree_sessions(world: World, sessiondir: str) -> list:
+    """The bound session dir plus every descendant.
+
+    Each child id in the wisp.run.json children list resolves
+    against the dir that holds the current session dir. A child joins when
+    the dir exists and holds wisp.jsonl; a missing id is skipped. A
+    broken wisp.run.json ends that branch: the dir stays in the
+    universe, its children do not resolve. The visited set stops
+    cycles."""
+    fs = world.get("fs")
+    out = []
+    stack = [sessiondir]
+    visited = set()
+    while stack:
+        path = fs.realpath(stack.pop())
+        if path in visited:
+            continue
+        visited.add(path)
+        out.append(path)
+        for child_id in child_ids_of(world, path):
+            child = os.path.join(os.path.dirname(path), child_id)
+            if fs.isdir(child) and fs.exists(os.path.join(child, "wisp.jsonl")):
+                stack.append(child)
+    return out
+
+
+def child_ids_of(world: World, path: str) -> list:
+    """The children list of one session dir's wisp.run.json; [] when the
+    file is missing, not JSON, not an object, or children is not a
+    list."""
+    try:
+        setup = json.loads(world.get("fs").read_text(
+            os.path.join(path, "wisp.run.json")))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(setup, dict):
+        return []
+    children = setup.get("children")
+    return children if isinstance(children, list) else []
+
+
+def sorted_sessions(world: World, paths: list) -> list:
+    """Newest wisp.jsonl first; ties by path, descending. One order
+    rule for all three scopes: sorting
+    (mtime, path) ascending and reversing gives both."""
+    fs = world.get("fs")
+    return sorted(paths,
+                  key=lambda path: (fs.mtime(path + "/wisp.jsonl"), path),
+                  reverse=True)
+
+
+def session_line(world: World, path: str) -> str:
+    """One ls line: `<session-dir> model=<model> records=<n> last=<iso>`.
+
+    model comes from wisp.run.json; a missing or broken file renders
+    model=?. records is the parse_records count of wisp.jsonl. last is
+    the wisp.jsonl mtime as local time, ISO format, seconds precision."""
+    fs = world.get("fs")
+    model = "?"
+    try:
+        setup = json.loads(fs.read_text(path + "/wisp.run.json"))
+    except (OSError, ValueError):
+        setup = None
+    if isinstance(setup, dict) and setup.get("model"):
+        model = str(setup["model"])
+    records = parse_records(fs.read_text(path + "/wisp.jsonl"))
+    mtime = datetime.fromtimestamp(fs.mtime(path + "/wisp.jsonl"))
+    return "%s model=%s records=%d last=%s" % (
+        path, model, len(records), mtime.isoformat(timespec="seconds"))
+
+
+def ls_command(world: World, opts: Any) -> int:
+    """`wisp ls`: one line per session of the scope, newest first.
+
+    Read-only over every scope: the session dirs of the scope list as
+    `<session-dir> model=<model> records=<n> last=<iso>`, newest
+    wisp.jsonl first. Project scope is the default; --global reads the
+    registry, --tree the descendants of one session dir. An empty
+    universe prints nothing and exits 0."""
+    out = world.get("stdout")
+    for path in sorted_sessions(world, scope_paths(world, opts)):
+        out.write(session_line(world, path) + "\n")
+    return 0
+
+
+def grep_command(world: World, opts: Any) -> int:
+    """`wisp grep`: search the record text of the scope's sessions.
+
+    The pattern is a Python regex; -i sets ignorecase. One line per
+    matching record of every session dir in the scope, then exit 0; no
+    matches exit 1. Read-only like ls; nothing is written
+    anywhere."""
+    pattern = grep_pattern(world, opts)
+    out = world.get("stdout")
+    found = False
+    for path in sorted_sessions(world, scope_paths(world, opts)):
+        for line in grep_session(world, path, pattern):
+            out.write(line + "\n")
+            found = True
+    return 0 if found else 1
+
+
+def grep_pattern(world: World, opts: Any):
+    """The compiled pattern: re.search over the record search text, -i
+    sets ignorecase. An invalid pattern fails with one stderr line and
+    exit 1."""
+    try:
+        return re.compile(opts.pattern,
+                          re.IGNORECASE if opts.ignorecase else 0)
+    except re.error as exc:
+        fail(world, "wisp grep: invalid pattern: %s" % exc)
+
+
+def grep_session(world: World, path: str, pattern) -> list:
+    """The matching lines of one session in log order.
+
+    system, user and tool records search their content, assistant
+    records the joined text of their text blocks, reasoning blocks
+    excluded. One `<session-dir> <n> <type>: <first matching line>` per
+    record, n from 1 in log order, the line cut to 200 characters."""
+    records = parse_records(world.get("fs").read_text(path + "/wisp.jsonl"))
+    out = []
+    for n, rec in enumerate(records, 1):
+        text = record_search_text(rec)
+        if not pattern.search(text):
+            continue
+        out.append("%s %d %s: %s" % (path, n, rec.get("type"),
+                                     record_match_line(text, pattern)[:200]))
+    return out
+
+
+def record_search_text(rec: dict) -> str:
+    """The searchable text of one record: the content for system, user
+    and tool records, the joined text of the text output blocks for an
+    assistant record. Reasoning blocks are excluded."""
+    if rec.get("type") == "assistant":
+        return "\n".join(block.get("text") or ""
+                         for block in rec.get("output") or []
+                         if block.get("type") == "text")
+    return rec.get("content") or ""
+
+
+def record_match_line(text: str, pattern) -> str:
+    """The first line of the search text that contains a match. A
+    multiline pattern falls back to the line that holds the match."""
+    for line in text.split("\n"):
+        if pattern.search(line):
+            return line
+    match = pattern.search(text)
+    start = text.rfind("\n", 0, match.start()) + 1
+    end = text.find("\n", match.start())
+    return text[start:] if end == -1 else text[start:end]
+
+
+COMMANDS: dict[str, Callable[[World, Any], int]] = {
+    "new": new_session,
+    "run": run_agent_loop,
+    "continue": continue_agent_loop,
+    "steer": steer_command,
+    "skill": skill_command,
+    "agents-md": agents_md_command,
+    "build-system-prompt": build_system_prompt,
+    "render-live": render_records,
+    "render-past": render_past,
+    "usage": usage_command,
+    "response": response_command,
+    "ls": ls_command,
+    "grep": grep_command,
+}
+
+
+# --- command-line parsing -------------------------------------------------------
+
+class Opts:
+    """Parsed command options: one instance per dispatched command."""
+
+    def __init__(self):
+        self.command = ""
+        self.sub = ""        # skill ls | skill read SKILL | agents-md ls | read-all
+        self.name = None     # new --name
+        self.skill = None    # skill read SKILL
+        self.model = None    # new -m
+        self.thinking = None # new -t
+        self.sessiondir = None   # run-family -d; resolved by resolve_sessiondir
+        self.sysfile = None  # new -s
+        self.parent = None   # new --parent
+        self.context_guard = None  # run/continue --context-guard
+        self.attach = []     # run --attach FILE, repeatable
+        self.skills = False  # build-system-prompt --skills
+        self.agents_md = False # build-system-prompt --agents-md
+        self.wisp = False    # build-system-prompt --wisp
+        self.env_in_system_prompt = False  # new --env-in-system-prompt
+        self.search_global = False  # ls/grep --global
+        self.tree = False           # ls/grep --tree
+        self.ignorecase = False     # grep -i
+        self.pattern = None         # grep PATTERN
+
+
+SESSION_DIR_COMMANDS = ("run", "continue", "steer", "render-past",
+                    "usage", "response")
+"""Commands that bind -d and WISP_SESSION_DIR. new has no -d; render-live
+listens on stdin only. skill, agents-md and build-system-prompt take
+no -d: they walk from the CWD upwards and read the user-level
+places. ls and grep join them only in --tree scope; project and
+global scope take neither."""
+
+
+def resolve_sessiondir(world: World, opts: Any) -> None:
+    """Set opts.sessiondir from -d, else WISP_SESSION_DIR, then validate it.
+
+    There is no CWD default: a run-family command without -d and
+    WISP_SESSION_DIR fails. A set but empty WISP_SESSION_DIR fails unless -d
+    overrides it; -d has the higher precedence and does not consult
+    the env.
+
+    ls and grep resolve a session dir only in --tree scope: project
+    and global scope take neither -d nor WISP_SESSION_DIR, so the guard
+    here also passes them through when
+    opts.tree is unset.
+    """
+    if opts.command not in SESSION_DIR_COMMANDS and not opts.tree:
+        return
+    if not opts.sessiondir:
+        env = world.get("env").get("WISP_SESSION_DIR")
+        env_dir = (env or "").strip()
+        if not env_dir:
+            if env is not None:
+                fail(world, "wisp %s: WISP_SESSION_DIR is set but empty"
+                            % opts.command)
+            fail(world, "wisp %s: pass -d DIR, or set WISP_SESSION_DIR"
+                        % opts.command)
+        opts.sessiondir = env_dir
+    validate_sessiondir(world, opts)
+
+
+def validate_sessiondir(world: World, opts: Any) -> None:
+    """The resolved session dir, by -d or by WISP_SESSION_DIR, must exist and
+    hold wisp.jsonl."""
+    if not world.get("fs").exists(opts.sessiondir):
+        fail(world, "wisp %s: session dir does not exist: %s"
+                    % (opts.command, opts.sessiondir))
+    if not world.get("fs").exists(opts.sessiondir + "/wisp.jsonl"):
+        fail(world, "wisp %s: no wisp.jsonl in session dir: %s"
+                    % (opts.command, opts.sessiondir))
+
+
+def parse_args(world: World, argv: list[str]) -> Any:
+    """Split argv into (command, opts). Subcommands travel in opts.sub.
+
+    -d DIR names the session directory for run, continue, render-past,
+    usage and response. Without -d, WISP_SESSION_DIR names it; without
+    both, the command fails. skill, agents-md and build-system-prompt do not
+    take -d; they keep their CWD-walk scope.
+    """
+    opts = Opts()
+    opts.command = argv[0]
+    if opts.command not in COMMANDS:
+        no_such_command(world, opts.command)
+    rest = argv[1:]
+    if "-h" in rest or "--help" in rest:
+        print_command_help(world, opts.command)
+    if opts.command in ("skill", "agents-md"):
+        if not rest:
+            fail(world, "wisp %s: use %s" % (opts.command, (
+                "ls, or read SKILL" if opts.command == "skill" else "ls or read-all")))
+        if opts.command == "skill" and rest[0] not in ("ls", "read"):
+            unknown_sub(world, opts.command, rest[0])
+        if opts.command == "agents-md" and rest[0] not in ("ls", "read-all"):
+            unknown_sub(world, opts.command, rest[0])
+        opts.sub = rest[0]
+        rest = rest[1:]
+        if opts.command == "skill" and opts.sub == "read":
+            if not rest:
+                fail(world, "wisp skill read: pass a SKILL name")
+            opts.skill = rest[0]
+            rest = rest[1:]
+
+    if opts.command in ("ls", "grep"):
+        positional = []
+        while rest:
+            arg = rest.pop(0)
+            if arg == "-d":
+                if not rest:
+                    fail(world, "wisp %s: -d needs a value" % opts.command)
+                opts.sessiondir = rest.pop(0)
+            elif arg == "--global":
+                opts.search_global = True
+            elif arg == "--tree":
+                opts.tree = True
+            elif arg == "-i":
+                opts.ignorecase = True
+            else:
+                positional.append(arg)
+        if opts.command == "grep":
+            if len(positional) != 1:
+                fail(world, "wisp grep: pass exactly one PATTERN")
+            opts.pattern = positional[0]
+        elif positional:
+            fail(world, "wisp ls: takes no arguments")
+        elif opts.ignorecase:
+            fail(world, "wisp ls: -i is a grep flag")
+        rest = []
+
+    valued = {"--name": "name", "-m": "model", "-t": "thinking",
+              "-d": "sessiondir", "-s": "sysfile", "--parent": "parent",
+              "--context-guard": "context_guard"}
+    while rest:
+        arg = rest.pop(0)
+        if arg.startswith("--context-guard="):
+            setattr(opts, "context_guard", arg.split("=", 1)[1])
+        elif arg in valued:
+            if not rest:
+                fail(world, "wisp: %s needs a value" % arg)
+            setattr(opts, valued[arg], rest.pop(0))
+        elif arg == "--skills":
+            opts.skills = True
+        elif arg == "--agents-md":
+            opts.agents_md = True
+        elif arg == "--wisp":
+            opts.wisp = True
+        elif arg == "--env-in-system-prompt":
+            opts.env_in_system_prompt = True
+        elif arg == "--attach":
+            if not rest:
+                fail(world, "wisp: --attach needs a value")
+            opts.attach.append(rest.pop(0))
+        else:
+            fail(world, "wisp %s: unknown argument %s" % (opts.command, arg))
+
+    if opts.command == "new":
+        if opts.env_in_system_prompt and not opts.sysfile:
+            fail(world, "wisp new: --env-in-system-prompt needs -s SYSFILE")
+        if not opts.model:
+            fail(world, "wisp new: -m MODEL is required")
+        if opts.sysfile and not world.get("fs").exists(opts.sysfile):
+            fail(world, "system file not found: %s" % opts.sysfile)
+    if opts.context_guard is not None:
+        if opts.command not in ("run", "continue"):
+            fail(world, "wisp %s: --context-guard is a flag of"
+                        " wisp run and wisp continue" % opts.command)
+        parse_context_guard(world, opts.context_guard)
+    if opts.command in ("skill", "agents-md", "build-system-prompt"):
+        if opts.sessiondir:
+            fail(world, "wisp %s: does not take -d" % opts.command)
+    if opts.command in ("run", "continue", "steer", "render-past",
+                        "usage", "response"):
+        if opts.model or opts.thinking or opts.sysfile or opts.parent:
+            fail(world, "wisp %s: takes only -d; model, thinking, the"
+                        " system record and the parent link live in the"
+                        " session dir" % opts.command)
+    if opts.command in ("ls", "grep"):
+        if opts.sessiondir and not opts.tree:
+            fail(world, "wisp %s: -d works only with --tree" % opts.command)
+        if opts.search_global and opts.tree:
+            fail(world, "wisp %s: one scope: --global and --tree"
+                        " together" % opts.command)
+    resolve_sessiondir(world, opts)
+    return opts.command, opts
+
+
+def command_help_text(cmd: str) -> str:
+    """The text under `wisp CMD --help`: the usage line plus the notes,
+    one entry per command, gathered from the module docstring and the
+    command handlers' behavior."""
+    return {
+        "new": "\n".join([
+            "wisp new: create a session dir under the sessions root and set it up.",
+            "",
+            "  wisp new --name NAME -m MODEL [-t THINKING] [-s SYSFILE]",
+            "           [--env-in-system-prompt] [--parent DIR]",
+            "",
+            "The session dir is the --name, else a rand8. Model and thinking go",
+            "to wisp.run.json; -s writes the system record as the first",
+            "wisp.jsonl entry. Fails on an existing session dir. Prints the full",
+            "path. Export the printed path to WISP_SESSION_DIR to bind it for",
+            "the next commands; a plain assignment does not reach them.",
+            "",
+            "  --name NAME                   the session dir name, else a rand8",
+            "  -m MODEL                      required, the run's model",
+            "  -t THINKING                   thinking fields, else the default set",
+            "  -s SYSFILE                    system prompt file, it must exist",
+            "  --env-in-system-prompt     prepend the ENVIRONMENT block, with the",
+            "                              session dir, the MODEL and the THINKING",
+            "                              lines, to -s SYSFILE",
+            "  --parent DIR                 link under this parent session dir;",
+            "                              give it to every child session;",
+            "                              a child without --parent is an",
+            "                              orphan; wisp ls --tree and",
+            "                              wisp grep --tree cannot see an",
+            "                              orphan; DIR must hold wisp.jsonl",
+            "                              and wisp.run.json; writes the",
+            "                              parent path into the child's",
+            "                              wisp.run.json and the child id",
+            "                              into the parent's children list",
+        ]) + "\n",
+        "run": "\n".join([
+            "wisp run: run LLM rounds; stream each round to stdout,",
+            "commit each completed round to wisp.jsonl as it ends.",
+            "",
+            "  wisp run [-d DIR] [--attach FILE] [--context-guard LIMIT]",
+            "           < prompt",
+            "",
+            "The session dir carries the setup. Model and thinking come from",
+            "wisp.run.json; then the command is uniform. The prompt is",
+            "read from stdin. --attach FILE, repeatable, stores one image",
+            "attachment per file on the user record: PNG, JPEG, GIF,",
+            "WebP; the bytes go inline as base64. A missing file or a",
+            "non-image fails before the run starts.",
+            "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp run",
+            "fails. The session dir must hold wisp.jsonl.",
+            "Steering: `wisp steer` queues messages in",
+            "<DIR>/wisp.steer.inbox; the run drains the inbox at each",
+            "round boundary, before its prompt on a stale inbox, and",
+            "warns on stderr when messages wait past the run's end.",
+            "Context guard: --context-guard LIMIT stops the run at a",
+            "round boundary when the last round's prompt tokens cross",
+            "the limit. '70%' is a percent of the model's context",
+            "window from wisp.modelcfg; '150k', '1m' and a plain",
+            "number are token limits. The stop exits 75 with one",
+            "stderr line, commits every finished round, and keeps the",
+            "session resumable: wisp run, wisp continue and wisp steer",
+            "all work on it. Percent mode fails at start when",
+            "wisp.modelcfg holds no context window for the model.",
+            "Env: WISP_SESSION_DIR, WISP_LLM_URL, WISP_LLM_API_KEY,",
+            "WISP_LLM_MAX_TURNS.",
+        ]) + "\n",
+        "continue": "\n".join([
+            "wisp continue: finish an open segment without a new prompt.",
+            "",
+            "  wisp continue [-d DIR] [--context-guard LIMIT]",
+            "",
+            "Resume after a kill or a MAX_TURNS stop: the loaded",
+            "conversation runs as is, no user record is appended, so",
+            "the killed segment's rounds stay in the conversation as",
+            "plain history. A finished or empty session fails fast:",
+            "use `wisp run` with a prompt. A stale steer inbox drains",
+            "at the first resumed round boundary.",
+            "--context-guard LIMIT works as on wisp run; see the run",
+            "help for the forms and the exit code.",
+            "Reads no stdin.",
+            "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp",
+            "continue fails. The session dir must hold wisp.jsonl.",
+            "Env: WISP_SESSION_DIR, WISP_LLM_URL, WISP_LLM_API_KEY,",
+            "WISP_LLM_MAX_TURNS.",
+        ]) + "\n",
+        "steer": "\n".join([
+            "wisp steer: queue one steering message for the session's runs.",
+            "",
+            "  wisp steer [-d DIR] < message",
+            "",
+            "The message is the whole stdin text, its trailing newline off.",
+            "It lands as one JSON line in <DIR>/wisp.steer.inbox, appended",
+            "when the file holds earlier messages, so messages stack in",
+            "order. A live `wisp run` drains the inbox at each round",
+            "boundary and appends each line as a user record marked",
+            "wisp_steered, with one `data: {\"wisp\":\"steer\"}` line on the",
+            "stream; `wisp render-live` shows it behind a [steer] marker line.",
+            "Steering never opens a segment and never resets the round",
+            "counter. A run that ends with messages still waiting warns on",
+            "stderr; the next `wisp run` injects them before its prompt.",
+            "No liveness check: the command works on any session dir and",
+            "never disturbs a running loop.",
+            "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp",
+            "steer fails. The session dir must hold wisp.jsonl.",
+        ]) + "\n",
+        "skill": "\n".join([
+            "wisp skill: list or read a skill from the skill roots.",
+            "",
+            "  wisp skill ls",
+            "  wisp skill read SKILL",
+            "",
+            "ls prints name: description (path) per skill; read prints the",
+            "skill block for SKILL.",
+            "The roots scan in this order: project walk, user level, XDG",
+            "scope, WISP_SYSTEM_SKILLS.",
+            "The project walk goes from the CWD up to the git root, and",
+            "runs only inside a repo.",
+        ]) + "\n",
+        "agents-md": "\n".join([
+            "wisp agents-md: list or concatenate the AGENTS.md chain.",
+            "",
+            "  wisp agents-md ls",
+            "  wisp agents-md read-all",
+            "",
+            "ls prints each file in the chain; read-all prints each file",
+            "wrapped in an <agents-md src=\"PATH\"> XML block.",
+            "The chain holds ~/.agents/AGENTS.md and every AGENTS.md",
+            "and AGENTS.local.md from the root directory down to the",
+            "CWD. When one directory holds both files, AGENTS.local.md",
+            "goes after AGENTS.md.",
+            "The chain total order is ascending priority: the user file",
+            "first, the CWD file last. Later text carries more weight in",
+            "LLMs.",
+        ]) + "\n",
+        "build-system-prompt": "\n".join([
+            "wisp build-system-prompt: assemble a system prompt to stdout.",
+            "",
+            "  wisp build-system-prompt [--skills] [--agents-md] [--wisp] < extra",
+            "",
+            "--wisp  print the wisp block: harness, session dir map, turn model",
+            "Concatenates the wisp block (--wisp), AGENTS.md files",
+            "(--agents-md) and skill summaries (--skills) with the text on",
+            "stdin, each wrapped in its own XML block with a closing tag.",
+            "At least one of --wisp, --skills and --agents-md is required;",
+            "a non-tty stdin is always appended.",
+            "The AGENTS.md chain total order is ascending priority: the",
+            "user file first, the CWD file last. AGENTS.local.md files",
+            "join the chain after the AGENTS.md of their directory.",
+        ]) + "\n",
+        "render-live": "\n".join([
+            "wisp render-live: render the run's stdout stream from stdin as",
+            "plain text.",
+            "",
+            "  wisp render-live < stream",
+            "",
+            "Each thinking block opens with a [think] marker line and each",
+            "output block with [answer]. Tool-call headers print as",
+            "[bash 5s 5kb] with the command on the next line; tool results",
+            "sit behind a \U0001F7E2 exit=0 or a \U0001F534 exit=N dot line.",
+        ]) + "\n",
+        "render-past": "\n".join([
+            "wisp render-past: render a past run.",
+            "",
+            "  wisp render-past [-d DIR]",
+            "",
+            "Reads <DIR>/wisp.jsonl and feeds each stored record to the",
+            "renderer as the same payload the live stream carried.",
+            "Read-only: a broken line is skipped, a dangling tool_call",
+            "renders without its result.",
+            "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp",
+            "render-past fails. The session dir must hold wisp.jsonl.",
+        ]) + "\n",
+        "usage": "\n".join([
+            "wisp usage: print the run's cumulative usage statistics.",
+            "",
+            "  wisp usage [-d DIR]",
+            "",
+            "Reads <DIR>/wisp.usage once, the model from <DIR>/wisp.run.json,",
+            "and the model's entry from <DIR>/wisp.modelcfg, and prints one",
+            "modeline-style line: in {net} out {out} ${cost} {used}/{window}",
+            "{pct}%. No cache-hit field: most models do not report the",
+            "information.",
+            "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp",
+            "usage fails. Single-shot; it never talks to the backend.",
+        ]) + "\n",
+        "response": "\n".join([
+            "wisp response: print the run's final assistant message.",
+            "",
+            "  wisp response [-d DIR]",
+            "",
+            "Reads <DIR>/wisp.jsonl and prints the final assistant",
+            "message as text. The final assistant message is the last",
+            "assistant record's message. Read-only: no writes to the run",
+            "dir, no backend traffic.",
+            "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp",
+            "response fails.",
+        ]) + "\n",
+        "ls": "\n".join([
+            "wisp ls: list the sessions of one scope, newest first.",
+            "",
+            "  wisp ls [--global | --tree [-d DIR]]",
+            "",
+            "One line per session dir:",
+            "  <session-dir> model=<model> records=<n> last=<iso>",
+            "model comes from wisp.run.json, records is the wisp.jsonl",
+            "record count, last is the wisp.jsonl mtime as local ISO",
+            "time. A broken wisp.run.json renders model=? and an empty",
+            "scope prints nothing and exits 0.",
+            "The default scope is the project: the sessions root of the",
+            "CWD. --global covers every registered project through the",
+            "state registry; --tree covers one session and its",
+            "descendants, bound with -d DIR or WISP_SESSION_DIR.",
+            "-d works only with --tree; --global and --tree together",
+            "fail. Read-only: nothing is written anywhere.",
+        ]) + "\n",
+        "grep": "\n".join([
+            "wisp grep: search the record text of one scope's sessions.",
+            "",
+            "  wisp grep [-i] [--global | --tree [-d DIR]] PATTERN",
+            "",
+            "The pattern is a Python regular expression; -i sets",
+            "ignorecase. One line per matching record, in log order:",
+            "  <session-dir> <n> <type>: <first matching line>",
+            "n counts the records from 1; the line is cut to 200",
+            "characters. system, user and tool records search their",
+            "content; assistant records search their text output blocks.",
+            "Reasoning blocks are not searched. No matches exits 1.",
+            "The scope flags work as in wisp ls; --global and --tree",
+            "together fail. Read-only: nothing is written anywhere.",
+        ]) + "\n",
+    }[cmd]
+
+
+def print_command_help(world: World, cmd: str) -> None:
+    """Write `wisp CMD --help` to stdout and exit 0."""
+    world.get("stdout").write(command_help_text(cmd))
+    raise SystemExit(0)
+
+
+def unknown_sub(world: World, parent: str, sub: str) -> None:
+    """An unknown nested command: the error line on stderr, the parent
+    command's help on stdout, exit 1."""
+    world.get("stderr").write("wisp: unknown command: %s\n" % sub)
+    world.get("stdout").write(command_help_text(parent))
+    raise SystemExit(1)
+
+
+def no_such_command(world: World, cmd: str) -> None:
+    """An unknown top-level command: the error line on stderr, the
+    module docstring on stdout, exit 1. The single path to this
+    state: parse_args validates argv[0] first, so main never sees
+    an unvalidated command."""
+    world.get("stderr").write("wisp: unknown command: %s\n" % cmd)
+    world.get("stdout").write(__doc__)
+    raise SystemExit(1)
+
+
+# --- filesystem IO ----------------------------------------------------------------
+
+class Fs:
+    """All of wisp's file IO, one service on the standard library."""
+    def __init__(self, world: World):
+        self._world = world
+
+
+    def mkdir(self, path: str) -> None:
+        os.makedirs(path, exist_ok=True)
+
+    def write_text(self, path: str, text: str) -> None:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def replace_text(self, path: str, text: str) -> None:
+        """Replace a file's whole content atomically: write a sibling
+        temp file, then os.replace it over the path. A kill mid-
+        replace leaves either the old or the new content, never a mix
+        of both."""
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+
+    def append_text(self, path: str, text: str) -> None:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def read_text(self, path: str) -> str:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def read_bytes(self, path: str) -> bytes:
+        """The file bytes; one binary read for attachments."""
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def exists(self, path: str) -> bool:
+        return os.path.exists(path)
+
+    def listdir(self, path: str) -> list:
+        """The directory entries in os.listdir order; OSError passes to
+        the caller."""
+        return os.listdir(path)
+
+    def isfile(self, path: str) -> bool:
+        return os.path.isfile(path)
+
+    def isdir(self, path: str) -> bool:
+        return os.path.isdir(path)
+
+    def realpath(self, path: str) -> str:
+        return os.path.realpath(path)
+
+    def cwd(self) -> str:
+        return os.getcwd()
+
+    def size(self, path: str) -> int:
+        return os.path.getsize(path)
+
+    def mtime(self, path: str) -> float:
+        """The file's modification time, epoch seconds."""
+        return os.path.getmtime(path)
+
+    def symlink(self, target: str, path: str) -> None:
+        os.symlink(target, path)
+
+    def islink(self, path: str) -> bool:
+        return os.path.islink(path)
+
+    def readlink(self, path: str) -> str:
+        return os.readlink(path)
+
+    def remove(self, path: str) -> None:
+        os.remove(path)
+
+    def rename(self, src: str, dst: str) -> None:
+        os.rename(src, dst)
+
+    def last_byte(self, path: str) -> int | None:
+        """The file's last byte, or None when the file is missing or empty."""
+        size = os.path.getsize(path)
+        if not size:
+            return None
+        with open(path, "rb") as handle:
+            handle.seek(size - 1)
+            return handle.read(1)[0]
+
+    def read_head(self, path: str, limit: int) -> bytes:
+        """At most the first limit bytes of a file."""
+        with open(path, "rb") as handle:
+            return handle.read(limit)
+
+
+class Clock:
+    """Wall time in UTC milliseconds and monotonic seconds."""
+    def __init__(self, world: World):
+        self._world = world
+
+
+    def ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def epoch(self) -> int:
+        return int(time.time())
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+
+class Rng:
+    """Random tokens: session names and spill file names."""
+    def __init__(self, world: World):
+        self._world = world
+
+
+    def token(self, size: int = 8) -> str:
+        alphabet = string.ascii_lowercase + string.digits
+        return "".join(random.SystemRandom().choice(alphabet) for _ in range(size))
+
+
+class HttpError(Exception):
+    """One HTTP failure, with the status and a cause text in the message."""
+
+
+HTTP_TIMEOUT = 600
+
+REQUEST_ID_HEADERS = ("x-request-id", "x-litellm-request-id",
+                      "request-id", "x-amzn-requestid")
+
+
+def request_id_of_headers(headers: Any) -> str:
+    """The endpoint request id from one response's headers, or ''.
+
+    Proxies name the correlation header differently: LiteLLM sets
+    x-litellm-request-id, a native OpenAI service sets x-request-id.
+    Names compare lowercased, the well-known ones win in order, and
+    any other name that ends in request-id is the fallback. A
+    response with no such header leaves the field empty, so the log
+    line stays short."""
+    try:
+        pairs = list(headers.items())
+    except AttributeError:
+        return ""
+    found = {}
+    for name, value in pairs:
+        key = str(name).lower()
+        if value and key not in found:
+            found[key] = str(value)
+    for name in REQUEST_ID_HEADERS:
+        if name in found:
+            return found[name]
+    for key, value in found.items():
+        if key.endswith("request-id"):
+            return value
+    return ""
+
+
+class Http:
+    """Direct HTTP on urllib. The network reaches wisp only through this."""
+    def __init__(self, world: World):
+        self._world = world
+
+
+    def post_stream(self, url: str, headers: dict, body: dict,
+                    meta: dict | None = None) -> Iterator[str]:
+        """POST one request and yield its SSE lines.
+
+        `meta`, when given, receives the response `status` and the
+        endpoint `request_id` before the first line, and on an HTTP
+        error before the HttpError rises, so a caller can log the
+        correlation id of a request whose body carried no answer."""
+        request = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"),
+            headers=dict(headers), method="POST")
+        try:
+            response = urllib.request.urlopen(request, timeout=HTTP_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if meta is not None:
+                meta["status"] = exc.code
+                meta["request_id"] = request_id_of_headers(exc.headers)
+            snippet = exc.read(4096).decode("utf-8", "replace").strip()
+            raise HttpError("%s %s" % (exc.code, snippet or exc.reason)) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise HttpError(str(exc)) from exc
+        if meta is not None:
+            meta["status"] = getattr(response, "status", None)
+            meta["request_id"] = request_id_of_headers(
+                getattr(response, "headers", None))
+        with response:
+            for raw in response:
+                yield raw.decode("utf-8", "replace").rstrip("\r\n")
+
+    def get_json(self, url: str, headers: dict) -> Any:
+        request = urllib.request.Request(url, headers=dict(headers), method="GET")
+        try:
+            response = urllib.request.urlopen(request, timeout=HTTP_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            raise HttpError("%s %s" % (exc.code, exc.reason)) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise HttpError(str(exc)) from exc
+        with response:
+            try:
+                return json.loads(response.read().decode("utf-8", "replace"))
+            except ValueError as exc:
+                raise HttpError("not a JSON response: %s" % exc) from exc
+
+
+DRAIN_GRACE_SECONDS = 1  # bound on the post-kill / post-child-exit drain
+
+
+class Executor:
+    """Runs one argv with a byte cap and a lazy spill file.
+
+    run(argv, seconds, cap_bytes, spill_path_of) -> (rc, head, spill):
+    stdout (with stderr joined) reads through a select loop, deadline
+    enforced by the clock service; a timeout kills the child and rc is
+    124. The head holds at most cap_bytes and is filled to exactly
+    cap_bytes on overflow; the moment output passes
+    cap_bytes, a spill file is created exactly once through
+    spill_path_of() and the full output streams into it, head included.
+    With no overflow the spill is None and no file exists, on a timeout
+    too: a fitting partial rides in the head, so refetching it from a
+    spill would add no information. stdin is /dev/null. The child runs
+    in its own process session, so a timeout can SIGKILL the whole
+    tree: a `bash -c 'a | b | while'` pipeline keeps a subshell alive
+    after the direct child dies, and that subshell still holds the
+    stdout pipe.
+
+    output(argv, seconds=5) -> (rc, stdout_text): the small-scale tool
+    IO (git discovery), captured and decoded, no spill machinery.
+    """
+
+    def __init__(self, world: World):
+        self._world = world
+
+    def output(self, argv: list, seconds: int = 5) -> tuple:
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=seconds)
+        except subprocess.TimeoutExpired:
+            return 124, ""
+        return proc.returncode, proc.stdout or ""
+
+    def run(self, argv: list, seconds: int, cap_bytes: int, spill_path_of: Callable) -> tuple:
+        proc = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+        head = bytearray()
+        spill_path = [None]
+        spill_out = [None]
+
+        def route(chunk: bytes) -> None:
+            if spill_out[0] is not None:
+                spill_out[0].write(chunk)
+            else:
+                space = cap_bytes - len(head)
+                if space >= len(chunk):
+                    head.extend(chunk)
+                    return
+                spill_path[0] = spill_path_of()
+                spill_out[0] = open(spill_path[0], "wb")
+                spill_out[0].write(bytes(head))
+                spill_out[0].write(chunk)
+                if space > 0:
+                    head.extend(chunk[:space])
+
+        fd = proc.stdout.fileno()
+        deadline = self._world.get("clock").monotonic() + seconds
+        timed_out = False
+        abandoned = False
+
+        def drain_grace() -> None:
+            """Drain the pipe under the grace bound. Every read is guarded
+            by a select; on grace expiry stop and mark the output
+            abandoned (an escaped writer still holds the pipe)."""
+            nonlocal abandoned
+            grace_end = self._world.get("clock").monotonic() + DRAIN_GRACE_SECONDS
+            while True:
+                remaining = grace_end - self._world.get("clock").monotonic()
+                if remaining <= 0:
+                    abandoned = True
+                    return
+                if not select.select([fd], [], [], remaining)[0]:
+                    abandoned = True
+                    return
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    return
+                route(chunk)
+
+        try:
+            while True:
+                remaining = deadline - self._world.get("clock").monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    drain_grace()
+                    break
+                if proc.poll() is not None:
+                    drain_grace()
+                    break
+                if not select.select([fd], [], [], min(remaining, DRAIN_GRACE_SECONDS))[0]:
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                route(chunk)
+        finally:
+            if spill_out[0] is not None:
+                spill_out[0].close()
+            proc.stdout.close()
+        # The reap is not optional: until wait() runs, returncode is None
+        # and would fold a real exit code into 0 on the None-or-0 fold.
+        proc.wait()
+        rc = 124 if timed_out else (proc.returncode or 0)
+        return rc, bytes(head), spill_path[0], abandoned
+
+
+def git_root(world: World) -> str:
+    """The git toplevel from `git rev-parse --show-toplevel`, else "".
+    Handles worktrees, submodules and a set GIT_DIR; outside a repo it
+    returns empty and callers fall back."""
+    rc, text = world.get("exec").output(["git", "rev-parse", "--show-toplevel"])
+    return text.strip() if rc == 0 and text.strip() else ""
+
+
+def env_impl(world: World) -> Any:
+    """get(name, default) -> one environment value; IO through the world."""
+    return os.environ
+
+
+def _int_or(value: Any, default: int) -> int:
+    """Floor a number; take the default on a missing or non-number value."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    return default
+
+
+# --- composed services ------------------------------------------------------------
+
+class Session:
+    """The session files under world.get("sessiondir").
+
+    load_events() -> (records, committed): resume from wisp.jsonl up to
+      the commit point, or start a fresh log. On a fresh run the
+      returned records are empty but nothing is on disk yet, so
+      committed is 0 and the exit commit writes them.
+    commit_events(new_records): append new records; the round loop
+      and the exit commit both call it through flush_records, which
+      owns the shared commit point in world.
+    refresh_model_cfg(): best-effort /v1/model/info into wisp.modelcfg.
+    log(event, *fields): one wisp.log line, ms UTC timestamp first.
+    write_run_setup(path, model, thinking, parent): persist them;
+      thinking and the parent link only when set.
+    load_run_setup(path): read model/thinking back from wisp.run.json;
+      fail when it is missing, not JSON, or has no model.
+    write_initial_log(path, sysfile): create wisp.jsonl with the system
+      record first when sysfile is given, plus an empty wisp.usage.
+    """
+
+    def __init__(self, world: World):
+        self._world = world
+
+    def write_run_setup(self, path: str, model: str, thinking: str | None,
+                        parent: str | None = None) -> None:
+        """Persist the run setup into <path>/wisp.run.json; thinking
+        and the parent link only when set."""
+        setup = {"model": model}
+        if thinking:
+            setup["thinking"] = thinking
+        if parent:
+            setup["parent"] = parent
+        self._world.get("fs").write_text(
+            path + "/wisp.run.json", json.dumps(setup, sort_keys=True) + "\n")
+
+    def load_run_setup(self, path: str) -> dict:
+        """Read the run setup from <path>/wisp.run.json."""
+        world, fs = self._world, self._world.get("fs")
+        cfgpath = path + "/wisp.run.json"
+        if not fs.exists(cfgpath):
+            fail(world, "session dir has no wisp.run.json: %s" % path)
+        try:
+            setup = json.loads(fs.read_text(cfgpath))
+        except ValueError:
+            fail(world, "wisp.run.json is not JSON: %s" % cfgpath)
+        if not isinstance(setup, dict) or not setup.get("model"):
+            fail(world, "wisp.run.json has no model: %s" % cfgpath)
+        return setup
+
+    def write_initial_log(self, path: str, system_text: str | None) -> None:
+        """Create wisp.jsonl, the system record first when system_text is
+        given, plus an empty wisp.usage."""
+        world, fs = self._world, self._world.get("fs")
+        records = []
+        if system_text:
+            records.append({"type": "system",
+                            "content": system_text.rstrip("\n")})
+        fs.write_text(path + "/wisp.jsonl", "".join(
+            json.dumps(rec, ensure_ascii=False) + "\n" for rec in records))
+        fs.write_text(path + "/wisp.usage", "")
+
+    def load_events(self) -> tuple:
+        env = self._world.get("env")
+        if not env.get("WISP_LLM_URL"):
+            fail(self._world, "WISP_LLM_URL is not set")
+        if not env.get("WISP_LLM_API_KEY"):
+            fail(self._world, "WISP_LLM_API_KEY is not set")
+
+        world, fs, sessiondir = self._world, self._world.get("fs"), self._world.get("sessiondir")
+        path = sessiondir + "/wisp.jsonl"
+        fs.mkdir(sessiondir)
+
+        if fs.exists(path) and fs.size(path):
+            records = self._reload_committed(path)
+            return records, len(records)
+        fs.write_text(path, "")
+        fs.write_text(sessiondir + "/wisp.usage", "")
+        return [], 0
+
+    def _reload_committed(self, path: str) -> list:
+        """Rebuild committed records; drop a partial trailing tool round.
+
+        An assistant record with tool_call blocks commits only when all
+        of its tool records follow. A record that fails json.loads is a
+        mid-commit kill; when anything is dropped the log is rewritten
+        without it, so the next commit appends clean. Every drop writes
+        one dropped line to wisp.log, so a lost tail is never silent.
+        Raw segment records after the last assistant message are
+        valid: a run killed mid-segment leaves its finished rounds on
+        disk, and the next run loads them as plain history before its
+        own prompt.
+        """
+        world, fs = self._world, self._world.get("fs")
+        records, pending, results = [], None, []
+        wanted = have = 0
+        dropped = 0
+        for line in fs.read_text(path).split("\n"):
+            if not line.strip():
+                continue  # the separator law: a trailing newline
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                dropped += 1
+                continue
+            if not isinstance(rec, dict):
+                dropped += 1
+                continue
+            kind = rec.get("type")
+            if pending is not None and kind == "tool":
+                results.append(rec)
+                have += 1
+                if have >= wanted:
+                    records.append(pending)
+                    records.extend(results)
+                    pending, results, wanted, have = None, [], 0, 0
+            elif kind == "assistant":
+                count = sum(1 for b in rec.get("output") or []
+                            if b.get("type") == "tool_call")
+                if count:
+                    pending = rec
+                    wanted = count
+                else:
+                    records.append(rec)
+            else:
+                records.append(rec)
+        if pending is not None:
+            dropped += 1
+        if dropped:
+            self.log("dropped", "records=%s" % dropped)
+            fs.replace_text(path, "".join(
+                json.dumps(rec, ensure_ascii=False) + "\n" for rec in records))
+        return records
+
+    def commit_events(self, new_records: list) -> None:
+        """Append the run's new records once, one JSON object per line.
+
+        The separator law holds: a log that ends with a newline stays
+        byte-identical when nothing appends. Each commit writes one
+        commit line to wisp.log; a no-op commit writes none.
+        """
+        if not new_records:
+            return
+        fs = self._world.get("fs")
+        path = self._world.get("sessiondir") + "/wisp.jsonl"
+        if fs.exists(path) and fs.last_byte(path) not in (None, 10):
+            fs.append_text(path, "\n")
+        fs.append_text(path, "".join(
+            json.dumps(rec, ensure_ascii=False) + "\n"
+            for rec in new_records))
+        self.log("commit", "records=%s" % len(new_records))
+
+    def refresh_model_cfg(self) -> None:
+        """One best-effort /v1/model/info fetch into wisp.modelcfg.
+
+        On any failure warn on stderr, write nothing, keep running.
+        Costs map to per-1M rates; the shape matches wisp.modelcfg.
+        """
+        world = self._world
+        url = world.get("env").get("WISP_LLM_URL", "").rstrip("/")
+        key = world.get("env").get("WISP_LLM_API_KEY", "")
+        try:
+            data = world.get("http").get_json(
+                url + "/v1/model/info", {"Authorization": "Bearer %s" % key})
+        except Exception as exc:
+            world.get("stderr").write(
+                "wisp: warning: cannot fetch model config from %s (%s)\n" % (url, exc))
+            self.log("modelcfg", "error=%s" % str(exc)[:300])
+            return
+        table = {}
+        for entry in data.get("data") or []:
+            name = entry.get("model_name")
+            if not name:
+                continue
+            info = entry.get("model_info") or {}
+            table[name] = {
+                "context": info.get("max_input_tokens") or 0,
+                "input": (info.get("input_cost_per_token") or 0) * 1000000,
+                "output": (info.get("output_cost_per_token") or 0) * 1000000,
+                "cacheRead": (info.get("cache_read_input_token_cost") or 0) * 1000000,
+                "cacheWrite": (info.get("cache_creation_input_token_cost") or 0) * 1000000,
+            }
+        if not table:
+            world.get("stderr").write(
+                "wisp: warning: model config from %s has no usable entries\n" % url)
+            return
+        world.get("fs").write_text(world.get("sessiondir") + "/wisp.modelcfg",
+                                   json.dumps(table, sort_keys=True) + "\n")
+        self.log("modelcfg", "written=1")
+
+    def log(self, event: str, *fields: str) -> None:
+        line = "%s %s %s\n" % (self._world.get("clock").ms(), event, " ".join(fields))
+        self._world.get("fs").append_text(self._world.get("sessiondir") + "/wisp.log", line)
+
+
+class Tools:
+    """The bash, python3, and load_image tools.
+
+    execute(calls) -> tool records, one per call, run order. Each call
+    injects `data: {"wisp":"tool_call","name":...,"timeoutSeconds":...,
+    "maxKilobytes":...,"command":...}` before it runs and
+    `data: {"wisp":"tool_result","name":...,"call_id":...,"content":...,
+    "exit":...}` after. Defaults: 5s timeout, 5kB output cap. A command
+    at most 64kB runs through the -c argument with its head in memory;
+    a bigger command or output beyond the cap goes to
+    <sessiondir>/spill/<rand8>, and spill files are never deleted.
+    """
+
+    def __init__(self, world: World):
+        self._world = world
+
+    def execute(self, calls: list) -> list:
+        return [self._execute_one(call) for call in calls]
+
+    def _execute_one(self, call: dict) -> dict:
+        world = self._world
+        name = call.get("name") or ""
+        record = {"type": "tool", "call_id": call.get("id"), "name": name,
+                  "content": "", "exit": 0}
+        started = world.get("clock").ms()
+        safe_log(world, "tool", "start", "name=%s" % name,
+                 "call_id=%s" % record["call_id"])
+        try:
+            args = json.loads(call.get("arguments") or "")
+        except ValueError:
+            args = None
+        command = args.get("command") if isinstance(args, dict) else None
+        if name == "load_image":
+            path = args.get("path") if isinstance(args, dict) else None
+            self._inject({"wisp": "tool_call", "name": name,
+                          "command": path if isinstance(path, str) else ""})
+            self._run_load_image(record, args if isinstance(args, dict) else {})
+        elif name in ("bash", "python3") and isinstance(command, str):
+            seconds = _int_or(args.get("timeoutSeconds"), DEFAULT_TOOL_TIMEOUT)
+            maxkb = _int_or(args.get("maxKilobytes"), DEFAULT_TOOL_MAXKB)
+            self._inject({"wisp": "tool_call", "name": name,
+                          "timeoutSeconds": seconds, "maxKilobytes": maxkb,
+                          "command": command})
+            self._run_tool(record, name, command, seconds, maxkb)
+        else:
+            if name not in ("bash", "python3"):
+                record["content"] = "wisp: unknown tool name '%s'" % name
+            else:
+                record["content"] = "wisp: tool call had no valid command argument"
+            record["exit"] = 1
+            self._inject({"wisp": "tool_call", "name": name,
+                          "timeoutSeconds": "?", "maxKilobytes": "?",
+                          "command": command if isinstance(command, str)
+                          else (call.get("arguments") or "")})
+        safe_log(world, "tool", "end", "name=%s" % name,
+                 "call_id=%s" % record["call_id"],
+                 "exit=%s" % record["exit"],
+                 "ms=%s" % (world.get("clock").ms() - started),
+                 "bytes=%s" % len(record["content"]))
+        payload = {"wisp": "tool_result", "name": name,
+                   "call_id": record["call_id"], "content": record["content"],
+                   "exit": record["exit"]}
+        if record.get("attachments"):
+            payload["attachments"] = [
+                {"name": att["name"], "media_type": att["media_type"]}
+                for att in record["attachments"]]
+        self._inject(payload)
+        return record
+
+    def _run_load_image(self, record: dict, args: dict) -> None:
+        """Read one image file into record["attachments"].
+
+        The media type comes from the file bytes. A resize failure or
+        an unsupported file degrades to a text note with exit 1, so
+        the model learns why it cannot see the image.
+        """
+        world = self._world
+        path = args.get("path")
+        resize = args.get("resize", True)
+        if not isinstance(resize, bool):
+            resize = True
+        if not isinstance(path, str) or not path:
+            record["content"] = "wisp: load_image needs a path argument"
+            record["exit"] = 1
+            return
+        fs = world.get("fs")
+        if not fs.isfile(path):
+            record["content"] = "wisp: load_image: no such file: %s" % path
+            record["exit"] = 1
+            return
+        raw = fs.read_bytes(path)
+        media = sniff_image_media(raw[:16])
+        if media is None:
+            record["content"] = (
+                "wisp: load_image: not a supported image (png, jpeg, gif, "
+                "webp): %s" % path)
+            record["exit"] = 1
+            return
+        if resize:
+            result = resize_image(raw, media)
+        else:
+            result = {"data": base64.b64encode(raw).decode("ascii"),
+                      "media_type": media, "note": ""}
+        if result.get("error"):
+            record["content"] = "wisp: load_image: %s: %s" % (
+                path, result["error"])
+            record["exit"] = 1
+            return
+        record["attachments"] = [
+            {"name": os.path.basename(path),
+             "media_type": result["media_type"], "data": result["data"]}]
+        lines = ["Loaded image: %s (%s, %d bytes)."
+                 % (os.path.basename(path), result["media_type"], len(raw))]
+        if result.get("note"):
+            lines.append(result["note"])
+        record["content"] = "\n".join(lines)
+
+    def _run_tool(self, record: dict, name: str, command: str,
+                  seconds: int, maxkb: int) -> None:
+        """Run one command; fill content and exit into the record.
+
+        No file is created for a small, quick command: the head stays in
+        memory. A spill file appears only when the output overflows the
+        cap or the command itself exceeds 64kB; it is never deleted.
+        """
+        rc, head, spill_path, abandoned = self._world.get("exec").run(
+            self._argv(name, command), seconds, maxkb * 1000, self._spill)
+        record["exit"] = rc
+        content = head.decode("utf-8", "replace")
+        notes = []
+        if spill_path:
+            spill_size = self._world.get("fs").size(spill_path)
+            cap_bytes = maxkb * 1000
+            offset = cap_bytes + 1
+            rest_kb = (spill_size - cap_bytes + 999) // 1000
+            if rest_kb > maxkb:
+                # The rest alone exceeds the same cap, so a plain tail read
+                # spills again. Say so, and give the exact maxKilobytes
+                # that makes the same tail read return the full rest in
+                # one clean call. rest_kb is ceil, so maxKilobytes=rest_kb
+                # covers every rest byte: output equal to the cap does not
+                # spill.
+                notes.append(
+                    "Output greater than maxKilobytes=%s. Full output written to: %s. "
+                    "The rest of the spill file is %skb. To read the rest of the "
+                    "output there are 2 options:\n"
+                    "- read the next page with: tail -c +%s %s "
+                    "(Note: this will spill again)\n"
+                    "- set maxKilobytes=%s on the tool call and read with: "
+                    "tail -c +%s %s (Note: this will read the full contents)"
+                    % (maxkb, spill_path, rest_kb, offset, spill_path,
+                       rest_kb, offset, spill_path))
+            else:
+                notes.append(
+                    "Output greater than maxKilobytes=%s. Full output written to: %s. "
+                    "Use tail -c +%s %s to keep reading. The rest of the spill file "
+                    "is %skb. Your tool call allows setting maxKilobytes to adjust "
+                    "the max returned output size."
+                    % (maxkb, spill_path, offset, spill_path, rest_kb))
+        if rc == 124:
+            notes.append("Run took longer than timeoutSeconds=%s. Forced exit code 124."
+                         % seconds)
+        if abandoned:
+            notes.append("Output abandoned after the drain grace; the spill file may be partial.")
+        if notes:
+            content += "\n---\nTool call notes:\n" + "\n".join(notes)
+        record["content"] = content
+
+    def _argv(self, name: str, command: str) -> list:
+        """[name, -c, command], or a spill-dir command file when the
+        command itself would outgrow the OS per-argument limit."""
+        if len(command.encode("utf-8")) <= 65536:
+            return [name, "-c", command]
+        cmd_file = self._spill()
+        self._world.get("fs").write_text(cmd_file, command)
+        return [name, cmd_file]
+
+    def _spill(self) -> str:
+        """One fresh spill path; the spill dir comes with it."""
+        world = self._world
+        spill_dir = world.get("sessiondir") + "/spill"
+        world.get("fs").mkdir(spill_dir)
+        return spill_dir + "/" + world.get("rng").token(8)
+
+    def _inject(self, payload: dict) -> None:
+        self._world.get("stdout").write(
+            "data: %s\n" % json.dumps(payload, ensure_ascii=False))
+
+
+# --- the LLM turn -------------------------------------------------------------
+
+# --- llm provider layer ---------------------------------------------------------
+
+# The provider layer maps one stored conversation to three wire formats
+# and back, behind build_request, sse_stream and the turn accumulator.
+# openai-chat keeps the byte-stable body the cache prefix needs; the
+# other two keep the same invariant through per-provider stable key
+# order. Every layer piece is a pure function of the records, so fresh
+# and resumed runs serialize to the same bytes.
+
+DEFAULT_MAX_TOKENS = 4096
+"""The anthropic max_tokens cap per turn; WISP_LLM_MAX_TOKENS overrides."""
+
+DEFAULT_THINKING_BUDGET = 8192
+"""The anthropic thinking budget per turn; WISP_LLM_THINKING_BUDGET overrides."""
+
+ANTHROPIC_MIN_BUDGET = 1024
+"""The smallest thinking budget the anthropic API accepts."""
+
+PROVIDERS = ("openai-chat", "openai-responses", "anthropic")
+
+
+def provider_of(world: World) -> str:
+    """The wire format for this run: WISP_LLM_API, default openai-chat.
+
+    Read per run through the world env service, never stored in
+    wisp.run.json, so old sessions keep their format until a caller
+    opts in by env, and the body builder stays a pure function of
+    the records plus the env.
+    """
+    try:
+        env = world.get("env")
+    except KeyError:
+        env = {}
+    api = (env.get("WISP_LLM_API") or "").strip() or "openai-chat"
+    if api not in PROVIDERS:
+        fail(world, "wisp: unknown WISP_LLM_API %s (use one of: %s)"
+             % (api, ", ".join(PROVIDERS)))
+    return api
+
+
+def auth_headers_of(world: World, provider: str) -> dict:
+    """Auth headers per provider. Bearer serves openai-chat and
+    openai-responses, and a LiteLLM proxy accepts Bearer on its
+    /v1/messages route too, so anthropic through LiteLLM stays
+    Bearer; WISP_LLM_ANTHROPIC_VERSION adds the version header when
+    the endpoint is a native Anthropic one that asks for it."""
+    key = world.get("env").get("WISP_LLM_API_KEY", "")
+    headers = {"Content-Type": "application/json"}
+    if provider == "anthropic":
+        headers["x-api-key"] = key
+        version = world.get("env").get("WISP_LLM_ANTHROPIC_VERSION")
+        if version:
+            headers["anthropic-version"] = version
+    else:
+        headers["Authorization"] = "Bearer %s" % key
+    return headers
+
+
+def path_of(provider: str) -> str:
+    """The endpoint path per provider."""
+    if provider == "openai-chat":
+        return "/v1/chat/completions"
+    if provider == "openai-responses":
+        return "/v1/responses"
+    return "/v1/messages"
+
+
+def tools_spec_of(provider: str) -> list:
+    """TOOLS_SPEC per provider: the nested OpenAI form for
+    openai-chat, the flat tag form for openai-responses, and the
+    name/description/input_schema form for anthropic. Key order is
+    stable per provider, so the serialized prefix stays byte-stable."""
+    if provider == "openai-chat":
+        return TOOLS_SPEC
+    out = []
+    for tool in TOOLS_SPEC:
+        fn = tool["function"]
+        if provider == "openai-responses":
+            out.append({"type": "function", "name": fn["name"],
+                        "description": fn["description"],
+                        "parameters": fn["parameters"]})
+        else:
+            out.append({"name": fn["name"],
+                        "description": fn["description"],
+                        "input_schema": fn["parameters"]})
+    return out
+
+
+def anthropic_system_text(records: list) -> str:
+    """The joined system texts of the record list; the anthropic body
+    carries the system prompt as one top-level string, not as a
+    message."""
+    return "\n".join(r["content"] for r in records if r.get("type") == "system")
+
+
+class Llm:
+    """One streamed chat-completions turn at one level of intent.
+
+    turn(records) -> {"assistant": record, "finish_reason": str,
+      "cached_tokens": int}. Usage chunk copies land in <sessiondir>/wisp.usage
+      through the fs service, one plain JSON line per chunk.
+    """
+
+    def __init__(self, world: World):
+        self._world = world
+        self._think_fields = (
+            world.get("env").get("WISP_THINK_FIELDS", DEFAULT_THINK_FIELDS).split(",")
+        )
+
+    def turn(self, records: list) -> dict:
+        world = self._world
+        body = build_request(world, records)
+        acc = TurnAcc(self._think_fields)
+        for payload in sse_stream(world, body):
+            acc.apply_delta(payload)
+
+        if acc.usage:
+            usage_lines = "".join(
+                "%s\n" % json.dumps(chunk, sort_keys=True) for chunk in acc.usage
+            )
+            world.get("fs").append_text(world.get("sessiondir") + "/wisp.usage", usage_lines)
+
+        return {
+            "assistant": {
+                "type": "assistant",
+                "output": acc.blocks,
+                "finish_reason": acc.finish_reason,
+                "usage": acc.usage,
+            },
+            "finish_reason": acc.finish_reason,
+            "cached_tokens": acc.cached_tokens,
+        }
+
+
+class TurnAcc:
+    """Captures one assistant turn without losing arrival order.
+
+    The model can interleave reasoning, output, and tool-call bursts in
+    any sequence; blocks land on acc.blocks in exactly that sequence. A
+    same-kind burst continues the last block only while it is still the
+    last block; every later burst opens a new one. Tool-call deltas merge
+    by index; a call keeps its first id and name while arguments
+    concatenate. finish_reason and cached_tokens take the last value seen.
+    """
+
+    def __init__(self, think_fields: list):
+        self.think_fields = think_fields
+        self.blocks = []
+        self._reasoning_open = True
+        self._calls = {}  # tool-call index -> block, arrival order in blocks
+        self.finish_reason = ""
+        self.cached_tokens = 0
+        self.usage = []
+
+    def _append_text(self, kind: str, value: str) -> None:
+        merge = (self.blocks and self.blocks[-1].get("type") == kind
+                 and (kind != "reasoning" or self._reasoning_open))
+        if merge:
+            self.blocks[-1]["text"] += value
+        else:
+            self.blocks.append({"type": kind, "text": value})
+        if kind == "reasoning":
+            self._reasoning_open = True
+
+    def apply_delta(self, payload: dict) -> None:
+        choice = next(iter(payload.get("choices") or []), {})
+        self.finish_reason = choice.get("finish_reason") or self.finish_reason
+        delta = choice.get("delta") or {}
+
+        usage = payload.get("usage")
+        if usage is not None:
+            self.usage.append(usage)
+            self.cached_tokens = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+
+        think = next((delta[f] for f in self.think_fields if delta.get(f)), "")
+        if think:
+            self._append_text("reasoning", think)
+
+        signature = delta.get("signature")
+        if signature:
+            for block in reversed(self.blocks):
+                if block.get("type") == "reasoning":
+                    block["signature"] = (block.get("signature") or "") + signature
+                    break
+            self._reasoning_open = False
+
+        encrypted = delta.get("encrypted_content")
+        if encrypted:
+            for block in reversed(self.blocks):
+                if block.get("type") == "reasoning":
+                    block["encrypted_content"] = encrypted
+                    break
+            self._reasoning_open = False
+
+        content = delta.get("content")
+        if content:
+            self._append_text("text", content)
+
+        for tc in delta.get("tool_calls") or []:
+            index = tc.get("index", 0)
+            block = self._calls.get(index)
+            if block is None:
+                block = {"type": "tool_call", "id": None, "name": None, "arguments": ""}
+                self.blocks.append(block)
+                self._calls[index] = block
+            if tc.get("id"):
+                block["id"] = tc["id"]
+            fn = tc.get("function") or {}
+            if fn.get("name"):
+                block["name"] = fn["name"]
+            block["arguments"] += fn.get("arguments") or ""
+
+
+TOOLS_SPEC = [
+    {"type": "function", "function": {
+        "name": "bash",
+        "description": "Run a bash command and return its output.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "The bash command to run."},
+            "maxKilobytes": {"type": "number", "description": "Maximum output size in kilobytes. Default 5."},
+            "timeoutSeconds": {"type": "number", "description": "Command timeout in seconds. Default 5."},
+        }, "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "python3",
+        "description": "Run a python3 command and return its output.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string", "description": "The python3 command to run. It is Python code, not a shell string."},
+            "maxKilobytes": {"type": "number", "description": "Maximum output size in kilobytes. Default 5."},
+            "timeoutSeconds": {"type": "number", "description": "Command timeout in seconds. Default 5."},
+        }, "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "load_image",
+        "description": "Load an image file into the conversation so you can see it. Supports PNG, JPEG, GIF, and WebP. The image is resized to the default limits unless resize is false.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Path to the image file."},
+            "resize": {"type": "boolean", "description": "Resize the image to the default dimension and byte limits. Default true. Set false to send the file bytes unchanged."},
+        }, "required": ["path"]}}},
+]
+
+
+IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
+"""Fixed-offset image magic bytes and their media types. WebP is
+not here: its magic is the RIFF....WEBP pair, checked separately in
+sniff_image_media."""
+
+def sniff_image_media(head: bytes) -> str | None:
+    """The media type from the file's first bytes, or None when no
+    supported image magic matches. The sniff reads bytes, not the
+    file extension."""
+    for magic, media in IMAGE_MAGIC:
+        if head.startswith(magic):
+            return media
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+MAX_IMAGE_DIMENSION = 2000
+"""The longest image side load_image keeps after a resize."""
+
+MAX_IMAGE_BASE64_BYTES = 4500000
+"""The base64 payload cap for one image. It stays below the 5MB
+provider limit with headroom."""
+
+
+def _pillow():
+    """The PIL.Image class, or None when Pillow is not installed.
+    Pillow is the one optional dependency: wisp imports it only when
+    load_image must resize an image."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    return Image
+
+
+def _encoded_candidates(img: Any) -> list:
+    """One PNG candidate and four JPEG candidates. PNG keeps
+    transparency; JPEG gives the byte cap more room. The caller picks
+    the smallest one that fits."""
+    out = []
+    buffer = io.BytesIO()
+    img.save(buffer, format="PNG")
+    out.append(("image/png", buffer.getvalue()))
+    rgb = img.convert("RGB")
+    for quality in (80, 70, 55, 40):
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="JPEG", quality=quality)
+        out.append(("image/jpeg", buffer.getvalue()))
+    return out
+
+
+def resize_image(raw: bytes, media: str) -> dict:
+    """Fit one image into the default limits.
+
+    Returns {"data", "media_type", "note"} on success, or {"error"}
+    when the image cannot fit. An image within both limits keeps its
+    exact bytes and gets an empty note. A resized image gets a note
+    that names the original and displayed sizes, so the model can map
+    coordinates back. The function tries PNG and JPEG encodings and
+    shrinks the dimensions by 0.75 until a candidate fits.
+    """
+    encoded = base64.b64encode(raw).decode("ascii")
+    if len(encoded) <= MAX_IMAGE_BASE64_BYTES:
+        Image = _pillow()
+        if Image is None:
+            return {"data": encoded, "media_type": media, "note": ""}
+        try:
+            with Image.open(io.BytesIO(raw)) as probe:
+                width, height = probe.size
+        except Exception:
+            return {"data": encoded, "media_type": media, "note": ""}
+        if width <= MAX_IMAGE_DIMENSION and height <= MAX_IMAGE_DIMENSION:
+            return {"data": encoded, "media_type": media, "note": ""}
+    Image = _pillow()
+    if Image is None:
+        return {"error": "image is too large and Pillow is not installed"}
+    try:
+        from PIL import ImageOps
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        img = ImageOps.exif_transpose(img)
+    except Exception as exc:
+        return {"error": "cannot read image (%s)" % exc}
+    original_width, original_height = img.size
+    width, height = original_width, original_height
+    if width > MAX_IMAGE_DIMENSION:
+        height = max(1, round(height * MAX_IMAGE_DIMENSION / width))
+        width = MAX_IMAGE_DIMENSION
+    if height > MAX_IMAGE_DIMENSION:
+        width = max(1, round(width * MAX_IMAGE_DIMENSION / height))
+        height = MAX_IMAGE_DIMENSION
+    while True:
+        resized = img.resize((width, height), Image.LANCZOS)
+        best = None
+        for candidate_media, blob in _encoded_candidates(resized):
+            candidate = base64.b64encode(blob).decode("ascii")
+            if len(candidate) > MAX_IMAGE_BASE64_BYTES:
+                continue
+            if best is None or len(candidate) < len(best[1]):
+                best = (candidate_media, candidate)
+        if best is not None:
+            note = ("[Image: original %dx%d, displayed at %dx%d. "
+                    "Multiply coordinates by %.2f to map to the original.]"
+                    % (original_width, original_height, width, height,
+                       original_width / width))
+            return {"data": best[1], "media_type": best[0], "note": note}
+        if width == 1 and height == 1:
+            break
+        width = max(1, int(width * 0.75))
+        height = max(1, int(height * 0.75))
+    return {"error": "image cannot fit the base64 byte cap"}
+
+
+def load_attachments(world: World, paths: list | None) -> list:
+    """One stored attachment per --attach path: name, sniffed
+    media_type, and the file bytes as base64 data. Fails fast on a
+    missing file or a file that is not a supported image, before any
+    LLM call."""
+    fs = world.get("fs")
+    out = []
+    for path in paths or []:
+        if not fs.isfile(path):
+            fail(world, "wisp run: --attach: no such file: %s" % path)
+        raw = fs.read_bytes(path)
+        media = sniff_image_media(raw[:16])
+        if media is None:
+            fail(world, "wisp run: --attach: not a supported image: %s"
+                        % path)
+        out.append({"name": os.path.basename(path),
+                    "media_type": media,
+                    "data": base64.b64encode(raw).decode("ascii")})
+    return out
+
+def data_uri_of(att: dict) -> str:
+    """One stored attachment as a data URI, the form the
+    openai dialects embed: 'data:<media_type>;base64,<data>'."""
+    return "data:%s;base64,%s" % (att["media_type"], att["data"])
+
+def message_of(rec: dict) -> dict:
+    """Map one stored record to its wire message.
+
+    text blocks join into content, reasoning blocks join into
+    reasoning_content (replayed, not stripped, so the cache prefix
+    hits), tool_call blocks keep their block order as tool_calls
+    entries. Key order is stable across fresh and resumed runs.
+    """
+    kind = rec["type"]
+    if kind == "assistant":
+        text = "".join(b["text"] for b in rec["output"] if b["type"] == "text")
+        reason = "".join(b["text"] for b in rec["output"] if b["type"] == "reasoning")
+        calls = [
+            {"id": b["id"], "type": "function",
+             "function": {"name": b["name"], "arguments": b["arguments"]}}
+            for b in rec["output"] if b["type"] == "tool_call"
+        ]
+        msg = {"role": "assistant", "content": text}
+        if reason:
+            msg["reasoning_content"] = reason
+        if calls:
+            msg["tool_calls"] = calls
+        return msg
+    if kind == "tool":
+        content = rec["content"]
+        if rec.get("attachments"):
+            content = content or "(see attached image)"
+        return {"role": "tool", "tool_call_id": rec["call_id"],
+                "content": content}
+    if kind == "user" and rec.get("attachments"):
+        parts = [{"type": "text", "text": rec["content"]}]
+        for att in rec["attachments"]:
+            parts.append({"type": "image_url",
+                          "image_url": {"url": data_uri_of(att)}})
+        return {"role": "user", "content": parts}
+    return {"role": kind, "content": rec["content"]}
+
+
+def items_of_responses(rec: dict) -> list:
+    """Map one stored record to openai-responses input items.
+
+    A system record stays a developer message item. A user record is
+    one user message item. An assistant record expands to a reasoning
+    item per reasoning block (with its encrypted_content when the
+    record holds one), then one message item for the text, then one
+    function_call item per tool-call block, keyed by the stored id as
+    call_id. A tool record is one function_call_output item keyed by
+    the stored call_id. Key order is stable, so the serialized item
+    list stays byte-stable across fresh and resumed runs; reasoning
+    items without encrypted_content (older sessions, or a record the
+    provider never signed) replay as nothing - the Responses API does
+    not require reasoning items to be present.
+    """
+    kind = rec["type"]
+    if kind == "system":
+        return [{"role": "developer",
+                 "content": [{"type": "input_text", "text": rec["content"]}]}]
+    if kind == "user":
+        parts = [{"type": "input_text", "text": rec["content"]}]
+        for att in rec.get("attachments") or []:
+            parts.append({"type": "input_image",
+                          "image_url": data_uri_of(att)})
+        return [{"role": "user", "content": parts}]
+    if kind == "assistant":
+        out = []
+        for b in rec["output"]:
+            if b["type"] == "reasoning":
+                item = {"type": "reasoning", "summary": []}
+                if b.get("encrypted_content"):
+                    item["encrypted_content"] = b["encrypted_content"]
+                out.append(item)
+            elif b["type"] == "text" and b["text"]:
+                out.append({"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text",
+                                         "text": b["text"]}]})
+            elif b["type"] == "tool_call":
+                out.append({"type": "function_call", "call_id": b["id"],
+                            "name": b["name"], "arguments": b["arguments"]})
+        return out
+    if kind == "tool":
+        if rec.get("attachments"):
+            parts = [{"type": "input_text",
+                      "text": rec["content"] or "(see attached image)"}]
+            for att in rec["attachments"]:
+                parts.append({"type": "input_image",
+                              "image_url": data_uri_of(att)})
+            return [{"type": "function_call_output",
+                     "call_id": rec["call_id"], "output": parts}]
+        return [{"type": "function_call_output", "call_id": rec["call_id"],
+                 "output": rec["content"]}]
+    return []
+
+
+def items_of_anthropic(rec: dict) -> list:
+    """Map one stored record to anthropic messages items.
+
+    A system record maps to nothing here; anthropic_system_text lifts
+    the system prompt to the top level. A user record is one user
+    message with one text block. An assistant record expands to one
+    thinking block per reasoning block - with its signature when the
+    record holds one - then one text block, then one tool_use block
+    per tool-call block; the API requires an unbroken run of the
+    original thinking blocks, so every stored reasoning block replays
+    in order, and a block without a signature is dropped: it cannot
+    pass the signature check, and dropping from the run start is the
+    legal removal. A tool record is one user message with one
+    tool_result block. Key order is stable, so the serialized body
+    stays byte-stable.
+    """
+    kind = rec["type"]
+    if kind == "system":
+        return []
+    if kind == "user":
+        content = [{"type": "text", "text": rec["content"]}]
+        for att in rec.get("attachments") or []:
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": att["media_type"],
+                "data": att["data"]}})
+        return [{"role": "user", "content": content}]
+    if kind == "assistant":
+        content = []
+        for b in rec["output"]:
+            if b["type"] == "reasoning":
+                block = {"type": "thinking", "thinking": b["text"]}
+                if b.get("signature"):
+                    block["signature"] = b["signature"]
+                else:
+                    continue
+                content.append(block)
+            elif b["type"] == "text" and b["text"]:
+                content.append({"type": "text", "text": b["text"]})
+            elif b["type"] == "tool_call":
+                content.append({"type": "tool_use", "id": b["id"],
+                                "name": b["name"],
+                                "input": json.loads(b["arguments"] or "{}")})
+        if not content:
+            return []
+        return [{"role": "assistant", "content": content}]
+    if kind == "tool":
+        if rec.get("attachments"):
+            content = [{"type": "text",
+                        "text": rec["content"] or "(see attached image)"}]
+            for att in rec["attachments"]:
+                content.append({"type": "image", "source": {
+                    "type": "base64", "media_type": att["media_type"],
+                    "data": att["data"]}})
+            return [{"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": rec["call_id"],
+                 "content": content}]}]
+        return [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": rec["call_id"],
+             "content": rec["content"]}]}]
+    return []
+
+
+def body_of_chat(world: World, records: list) -> dict:
+    """The openai-chat body, exactly as before the provider layer.
+
+    The steer tag applies to user text before message_of builds the
+    message - the same pre-mapper surgery the other builders do - so
+    a user record with attachments carries them in its text part and
+    the image parts pass through. For text-only records the strings
+    are byte-identical to the old post-mapper surgery."""
+    messages = []
+    pending_images = []
+    for rec in records:
+        wire_rec = rec
+        if wire_rec.get("type") == "user":
+            wire_rec = dict(wire_rec)
+            wire_rec["content"] = user_text_of(wire_rec)
+        if rec.get("type") == "tool":
+            messages.append(message_of(wire_rec))
+            pending_images.extend(rec.get("attachments") or [])
+            continue
+        if pending_images:
+            messages.append(chat_image_message(pending_images))
+            pending_images = []
+        messages.append(message_of(wire_rec))
+    if pending_images:
+        messages.append(chat_image_message(pending_images))
+    body = {
+        "model": world.get("model"),
+        "messages": messages,
+        "tools": TOOLS_SPEC,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    thinking = world.get("thinking")
+    if thinking:
+        body["reasoning_effort"] = thinking
+    return body
+
+
+def chat_image_message(attachments: list) -> dict:
+    """One user message that carries tool-result images.
+
+    The openai-chat tool message takes text only, so the images go in
+    one user message after the run of tool messages. The layer builds
+    it at serialization time; no such record is ever stored.
+    """
+    content = [{"type": "text",
+                "text": "Attached image(s) from tool result:"}]
+    for att in attachments:
+        content.append({"type": "image_url",
+                        "image_url": {"url": data_uri_of(att)}})
+    return {"role": "user", "content": content}
+
+
+def user_text_of(rec: dict) -> str:
+    """One user record's content with the steer tag applied."""
+    text = rec["content"]
+    if rec.get("wisp_steered"):
+        text = "%s\n\n%s" % (STEER_TAG, text.rstrip("\n"))
+    return text
+
+
+def body_of_responses(world: World, records: list) -> dict:
+    """The openai-responses body.
+
+    Items come from items_of_responses. The steer tag applies to
+    user text before the item list is built, so prefixes stay stable
+    across rounds. The
+    system text becomes the instructions field. store false keeps the
+    run stateless; reasoning items carry their encrypted_content back.
+    Thinking maps to reasoning.effort with the same level words the
+    Responses API takes.
+    """
+    input_items = []
+    instructions = ""
+    for rec in records:
+        kind = rec.get("type")
+        if kind == "system":
+            instructions = ((instructions + "\n" if instructions else "")
+                            + rec["content"])
+            continue
+        wire_rec = rec
+        if kind == "user":
+            wire_rec = dict(rec)
+            wire_rec["content"] = user_text_of(rec)
+        input_items.extend(items_of_responses(wire_rec))
+    body = {
+        "model": world.get("model"),
+        "input": input_items,
+        "tools": tools_spec_of("openai-responses"),
+        "stream": True,
+        "store": False,
+    }
+    if instructions:
+        body["instructions"] = instructions
+    thinking = world.get("thinking")
+    if thinking:
+        body["reasoning"] = {"effort": thinking}
+    return body
+
+
+def body_of_anthropic(world: World, records: list) -> dict:
+    """The anthropic messages body.
+
+    Items come from items_of_anthropic; the system text lifts to
+    the top level through anthropic_system_text over the system
+    records. The steer tag applies to user text. One top-level
+    cache_control marks the
+    deepest stable prefix - the last record before the new user turn -
+    so the conversation prefix, tools and system all cache; the
+    breakpoint moves forward as the conversation grows. max_tokens
+    carries the run cap; thinking maps to one thinking object with a
+    budget_tokens floor, and no unknown top-level field is ever set.
+    """
+    messages = []
+    system = ""
+    owner = []  # message index -> source record index
+    for ri, rec in enumerate(records):
+        kind = rec.get("type")
+        if kind == "system":
+            system = ((system + "\n" if system else "")
+                      + rec["content"])
+            continue
+        wire_rec = rec
+        if kind == "user":
+            wire_rec = dict(rec)
+            wire_rec["content"] = user_text_of(rec)
+        before = len(messages)
+        messages.extend(items_of_anthropic(wire_rec))
+        owner.extend([ri] * (len(messages) - before))
+    body = {
+        "model": world.get("model"),
+        "messages": messages,
+        "tools": tools_spec_of("anthropic"),
+        "stream": True,
+        "max_tokens": int(world.get("env").get(
+            "WISP_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS)),
+    }
+    if system:
+        body["system"] = system
+    if messages:
+        # two breakpoints: the last message, and the previous
+        # request's last message - the one built from the record just
+        # before the final assistant record, because that request held
+        # every record up to there. A read walk checks its own
+        # breakpoint position first, so marking where the previous
+        # request wrote finds that entry at distance one on every
+        # turn; the last-message mark writes the entry the next turn
+        # will mark. Two of the four breakpoint slots are used.
+        marks = [len(messages) - 1]
+        last_assistant = max(
+            (ri for ri, rec in enumerate(records)
+             if rec.get("type") == "assistant"), default=None)
+        if last_assistant and last_assistant > 0:
+            prev = max(i for i, o in enumerate(owner)
+                       if o == last_assistant - 1)
+            if prev not in marks:
+                marks.append(prev)
+        for mi in marks:
+            messages[mi].setdefault("content", [])
+            if (isinstance(messages[mi]["content"], list)
+                    and messages[mi]["content"]):
+                messages[mi]["content"][-1].setdefault(
+                    "cache_control", {"type": "ephemeral"})
+    thinking = world.get("thinking")
+    if thinking:
+        budget = max(int(world.get("env").get(
+            "WISP_LLM_THINKING_BUDGET", DEFAULT_THINKING_BUDGET)),
+            ANTHROPIC_MIN_BUDGET)
+        body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    return body
+
+
+def build_request(world: World, records: list) -> dict:
+    """Map stored turn records to the provider wire body. One choke point.
+
+    The collapse is a lossless join, never a reorder. Key order is
+    stable, so fresh and resumed run bodies serialize to the same
+    bytes. The thinking level passes through unchanged; the endpoint
+    rejects "off". stream_options.include_usage asks for the final
+    usage chunk, which some providers hold back without it. A steered
+    user message carries the STEER_TAG line before its content, so
+    the model can tell steering from the turn prompt; the tag is
+    stable per record, so prefixes stay stable too.
+    """
+    provider = provider_of(world)
+    if provider == "openai-chat":
+        return body_of_chat(world, records)
+    if provider == "openai-responses":
+        return body_of_responses(world, records)
+    return body_of_anthropic(world, records)
+
+
+def error_text_of(line: str) -> str:
+    """Extract the endpoint's error message from one JSON body line."""
+    try:
+        data = json.loads(line)
+    except ValueError:
+        return ""
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        return err.get("message") or ""
+    return str(err) if err is not None else ""
+
+
+STOP_REASON_OF = {
+    "end_turn": "stop", "stop_sequence": "stop", "tool_use": "tool_calls",
+    "max_tokens": "length", "refusal": "content_filter",
+}
+"""anthropic stop_reason -> the finish_reason word the run loop reads."""
+
+
+def responses_usage_of(usage: Any) -> dict | None:
+    """One responses-shaped usage object as the internal chat shape.
+
+    input_tokens_details.cached_tokens and cache_write_tokens map to
+    prompt_tokens_details; output_tokens_details.reasoning_tokens maps
+    to completion_tokens_details. A non-dict usage maps to None."""
+    if not isinstance(usage, dict):
+        return None
+    details = usage.get("input_tokens_details") or {}
+    out_details = usage.get("output_tokens_details") or {}
+    prompt = int(usage.get("input_tokens") or 0)
+    out = int(usage.get("output_tokens") or 0)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": out,
+        "total_tokens": int(usage.get("total_tokens") or prompt + out),
+        "prompt_tokens_details": {
+            "cached_tokens": int(details.get("cached_tokens") or 0),
+            "cache_write_tokens": int(details.get("cache_write_tokens") or 0),
+        },
+        "completion_tokens_details": {
+            "reasoning_tokens": int(out_details.get("reasoning_tokens") or 0),
+        },
+    }
+
+
+def anthropic_usage_of(usage: Any) -> dict | None:
+    """One anthropic-shaped usage object as the internal chat shape.
+
+    cache_read_input_tokens maps to cached_tokens,
+    cache_creation_input_tokens to cache_write_tokens, and
+    prompt_tokens sums the three input parts, so net tokens stay
+    honest. A non-dict usage maps to None."""
+    if not isinstance(usage, dict):
+        return None
+    read = int(usage.get("cache_read_input_tokens") or 0)
+    write = int(usage.get("cache_creation_input_tokens") or 0)
+    inp = int(usage.get("input_tokens") or 0)
+    out = int(usage.get("output_tokens") or 0)
+    return {
+        "prompt_tokens": inp + read + write,
+        "completion_tokens": out,
+        "total_tokens": inp + read + write + out,
+        "prompt_tokens_details": {
+            "cached_tokens": read, "cache_write_tokens": write},
+        "completion_tokens_details": {},
+    }
+
+
+def responses_chunk_of(payload: dict) -> dict | None:
+    """One responses stream event as one chat-shaped chunk, or None
+    when the event carries no turn content.
+
+    output_text and reasoning deltas map to content and reasoning;
+    function_call items and argument deltas map to tool_calls by
+    output_index; the completed event carries the normalized usage; a
+    done reasoning item carries its encrypted_content for replay."""
+    etype = payload.get("type") or ""
+    if not etype.startswith("response."):
+        return None
+    if etype == "response.output_text.delta":
+        return {"choices": [{"delta": {"content": payload.get("delta") or ""}}]}
+    if etype in ("response.reasoning_text.delta",
+                 "response.reasoning_summary_text.delta"):
+        return {"choices": [{"delta": {"reasoning": payload.get("delta") or ""}}]}
+    if etype == "response.output_item.added":
+        item = payload.get("item") or {}
+        if item.get("type") == "function_call":
+            return {"choices": [{"delta": {"tool_calls": [{
+                "index": payload.get("output_index", 0),
+                "id": item.get("call_id"), "type": "function",
+                "function": {"name": item.get("name") or "",
+                             "arguments": ""}}]}}]}
+        return None
+    if etype == "response.function_call_arguments.delta":
+        return {"choices": [{"delta": {"tool_calls": [{
+            "index": payload.get("output_index", 0),
+            "function": {"arguments": payload.get("delta") or ""}}]}}]}
+    if etype == "response.output_item.done":
+        item = payload.get("item") or {}
+        if item.get("type") == "reasoning" and item.get("encrypted_content"):
+            return {"choices": [{"delta": {
+                "encrypted_content": item["encrypted_content"]}}]}
+        return None
+    if etype in ("response.completed", "response.done",
+                 "response.incomplete"):
+        response = payload.get("response") or {}
+        items = response.get("output") or []
+        called = any(isinstance(i, dict) and i.get("type") == "function_call"
+                     for i in items)
+        finish = ("tool_calls" if called
+                  else "length" if etype == "response.incomplete"
+                  else "stop")
+        chunk = {"choices": [{"delta": {}, "finish_reason": finish}]}
+        usage = responses_usage_of(response.get("usage"))
+        if usage is not None:
+            chunk["usage"] = usage
+        return chunk
+    return None
+
+
+def anthropic_chunk_of(payload: dict) -> dict | None:
+    """One anthropic stream event as one chat-shaped chunk, or None
+    when the event carries no turn content.
+
+    message_start and message_delta carry the normalized usage - the
+    anthropic usage is cumulative, so the last chunk wins, which the
+    accumulator already implements. content_block deltas map text,
+    thinking, signature and partial_json to the matching fields; a
+    tool_use block start maps to one tool_calls entry by block index;
+    message_delta carries the mapped stop_reason. ping, message_stop
+    and unknown event types map to None and are skipped."""
+    etype = payload.get("type") or ""
+    if etype == "message_start":
+        usage = anthropic_usage_of((payload.get("message") or {}).get("usage"))
+        return {"choices": [{"delta": {}}], "usage": usage} if usage else None
+    if etype == "content_block_delta":
+        delta = payload.get("delta") or {}
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            return {"choices": [{"delta": {"content": delta.get("text") or ""}}]}
+        if dtype == "thinking_delta":
+            return {"choices": [{"delta": {"reasoning": delta.get("thinking") or ""}}]}
+        if dtype == "signature_delta":
+            return {"choices": [{"delta": {"signature": delta.get("signature") or ""}}]}
+        if dtype == "input_json_delta":
+            return {"choices": [{"delta": {"tool_calls": [{
+                "index": payload.get("index", 0),
+                "function": {"arguments": delta.get("partial_json") or ""}}]}}]}
+        return None
+    if etype == "content_block_start":
+        block = payload.get("content_block") or {}
+        if block.get("type") == "tool_use":
+            return {"choices": [{"delta": {"tool_calls": [{
+                "index": payload.get("index", 0), "id": block.get("id"),
+                "type": "function",
+                "function": {"name": block.get("name") or "",
+                             "arguments": ""}}]}}]}
+        return None
+    if etype == "message_delta":
+        delta = payload.get("delta") or {}
+        chunk = {"choices": [{"delta": {}, "finish_reason": STOP_REASON_OF.get(
+            delta.get("stop_reason"), "stop")}]}
+        usage = anthropic_usage_of(payload.get("usage"))
+        if usage is not None:
+            chunk["usage"] = usage
+        return chunk
+    return None
+
+
+def stream_error_of(payload: dict) -> str:
+    """The error message inside one stream error event, or ''.
+
+    Both the responses and the anthropic stream can carry an error
+    object mid-stream; the message inside names the failure."""
+    err = payload.get("error")
+    if isinstance(err, dict):
+        return err.get("message") or ""
+    if err is not None:
+        return str(err)
+    response = payload.get("response")
+    if isinstance(response, dict):
+        err = response.get("error")
+        if isinstance(err, dict):
+            return err.get("message") or ""
+    return ""
+
+
+def chunk_of(provider: str, payload: dict) -> dict | None:
+    """One stream payload as one chat-shaped chunk, or None.
+
+    openai-chat keeps the payload as is when it carries choices; the
+    other providers map through their event parser, which returns
+    None for events with no turn content."""
+    if provider == "openai-chat":
+        return payload if isinstance(payload, dict) and "choices" in payload else None
+    if provider == "openai-responses":
+        return responses_chunk_of(payload)
+    return anthropic_chunk_of(payload)
+
+
+def trace_fields_of(meta: dict) -> list:
+    """The response status and request id as wisp.log fields.
+
+    Both come from Http.post_stream through sse_stream's meta dict.
+    Each is absent until the endpoint answers, so a line logged
+    before the response carries neither, and a transport failure
+    with no response carries neither."""
+    fields = []
+    status = meta.get("status")
+    if status is not None:
+        fields.append("status=%s" % status)
+    reqid = meta.get("request_id")
+    if reqid:
+        fields.append("reqid=%s" % reqid)
+    return fields
+
+
+def request_suffix_of(meta: dict) -> str:
+    """One ' (request id: X)' tail for a failure text, or ''.
+
+    The id names the request in the proxy log, so a failed run can
+    be traced without a second failing request."""
+    reqid = meta.get("request_id")
+    return (" (request id: %s)" % reqid) if reqid else ""
+
+
+def request_note_of(meta: dict) -> str:
+    """One '; request id: X' tail for a parenthesized note, or ''."""
+    reqid = meta.get("request_id")
+    return ("; request id: %s" % reqid) if reqid else ""
+
+
+def sse_stream(world: World, body: dict) -> Iterator[dict]:
+    """Yield one parsed `data:` payload per chat-completion chunk.
+
+    Raw `data:` lines stream to stdout as they arrive, the `data: [DONE]`
+    marker is skipped, and unparseable payloads are skipped. Any other
+    line (comment, blank separator) is dropped. A body with no
+    `data:` line at all is not a chat-completion stream: the
+    first body line, parsed for an error field if it is JSON, names
+    the failure. An SSE stream that ends with no completion payload -
+    the observed empty reply is a lone data marker - is an empty turn
+    instead: it ends quietly after writing stream_note, and the
+    degenerate guard asks again with a nudge. Every stream leaves
+    its trace in wisp.log: one http post line before the request,
+    one http_done line with line and payload counts after a clean
+    end, one http_error line when the transport raises, and one
+    streamfail line with the first body line and sse=yes or no when
+    the body carried no choices payload - so a dead run can be told
+    apart from a slow endpoint, a firewall block, or a wisp fault.
+    Every line logged after the response carries the HTTP status and
+    the endpoint request id, so the proxy log entry for a bad answer
+    is one lookup away.
+    """
+    provider = provider_of(world)
+    url = (world.get("env").get("WISP_LLM_URL", "").rstrip("/")
+           + path_of(provider))
+    headers = auth_headers_of(world, provider)
+    http = world.get("http")
+    meta = {}
+    out = world.get("stdout")
+    first_line = ""
+    saw_data = False
+    accepted = False
+    started = world.get("clock").ms()
+    lines = 0
+    payloads = 0
+    safe_log(world, "http", "post", "url=%s" % url,
+             "bytes=%s" % len(json.dumps(body).encode("utf-8")))
+    try:
+        for line in http.post_stream(url, headers, body, meta):
+            lines += 1
+            if not first_line:
+                first_line = line
+            if not line.startswith("data:"):
+                continue
+            saw_data = True
+            text = line[len("data:"):].lstrip()
+            if text == "[DONE]":
+                continue
+            out.write(line + "\n")
+            try:
+                payload = json.loads(text)
+            except ValueError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            err = stream_error_of(payload)
+            if err:
+                safe_log(world, "streamfail", "url=%s" % url,
+                         "lines=%s" % lines, "payloads=%s" % payloads,
+                         "first=%s" % err[:300], *trace_fields_of(meta))
+                fail(world, "model endpoint returned a stream error: %s%s"
+                     % (err, request_suffix_of(meta)))
+            chunk = chunk_of(provider, payload)
+            if chunk is not None:
+                accepted = True
+                payloads += 1
+                yield chunk
+    except HttpError as exc:
+        safe_log(world, "http_error", "url=%s" % url,
+                 "ms=%s" % (world.get("clock").ms() - started),
+                 "lines=%s" % lines, "err=%s" % str(exc)[:300],
+                 *trace_fields_of(meta))
+        raise
+    safe_log(world, "http_done", "url=%s" % url, "lines=%s" % lines,
+             "payloads=%s" % payloads,
+             "ms=%s" % (world.get("clock").ms() - started),
+             *trace_fields_of(meta))
+    if not accepted:
+        detail = (error_text_of(first_line) or first_line
+                  or "<empty body>")[:200]
+        safe_log(world, "streamfail", "url=%s" % url, "lines=%s" % lines,
+                 "payloads=%s" % payloads, "first=%s" % detail,
+                 "sse=%s" % ("yes" if saw_data else "no"),
+                 *trace_fields_of(meta))
+        if not saw_data:
+            fail(world, "model endpoint returned an unexpected response:"
+                       " %s%s" % (detail, request_suffix_of(meta)))
+        world.set("stream_note",
+                  "the endpoint stream carried no completion payload"
+                  " (lines=%s payloads=%s first line: %s%s)"
+                  % (lines, payloads, detail, request_note_of(meta)))
+
+
+# --- skills and AGENTS.md ---------------------------------------------------------
+
+SKILL_DIRS = (".wisp/skills", ".agents/skills", ".claude/skills")
+
+
+def home_dir(env: Any) -> str:
+    """HOME through the world; the expanduser fallback keeps the value
+    exact when HOME is unset."""
+    return env.get("HOME") or os.path.expanduser("~")
+
+
+def expand_tilde(env: Any, path: str) -> str:
+    """A leading ~ through the world's HOME; ~user forms stay on
+    expanduser (pure string work, no IO)."""
+    if path == "~":
+        return home_dir(env)
+    if path.startswith("~/"):
+        return os.path.join(home_dir(env), path[2:])
+    return os.path.expanduser(path)
+
+
+def skill_roots(world: World) -> list:
+    """Skill dirs in scan order; canonical scope scans last, so a
+    project-local or user-local skill of the same name shadows it.
+
+    Project scope walks from the current dir up to `git rev-parse
+    --show-toplevel` (no walk outside a repo), then the user scope, then
+    the XDG scope, then WISP_SYSTEM_SKILLS (default $HOME/.agents/skills).
+    """
+    fs, env = world.get("fs"), world.get("env")
+    roots = []
+    cwd = fs.cwd()
+
+    project_root = git_root(world)
+    if project_root and cwd.startswith(project_root):
+        d = cwd
+        while True:
+            roots.extend(os.path.join(d, s) for s in SKILL_DIRS
+                         if fs.isdir(os.path.join(d, s)))
+            if d == project_root:
+                break
+            d = os.path.dirname(d)
+
+    home = home_dir(env)
+    roots.extend(os.path.join(home, s) for s in SKILL_DIRS
+                 if fs.isdir(os.path.join(home, s)))
+
+    xdg = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    if fs.isdir(os.path.join(xdg, "skills")):
+        roots.append(os.path.join(xdg, "skills"))
+    for part in (env.get("XDG_CONFIG_DIRS") or "").split(":"):
+        if part and fs.isdir(os.path.join(part, "skills")):
+            roots.append(os.path.join(part, "skills"))
+
+    for part in (env.get("WISP_SYSTEM_SKILLS",
+                         os.path.join(home, ".agents/skills")) or "").split(":"):
+        if part and fs.isdir(expand_tilde(env, part)):
+            roots.append(expand_tilde(env, part))
+    return roots
+
+
+def collect_skills(world: World) -> list:
+    """(name, description, path) triples, deduped by name and sorted.
+
+    Subdirs that hold a SKILL.md count, symlinks followed, symlink-loop
+    guarded by physical path. A dropped duplicate copy warns on stderr.
+    """
+    fs = world.get("fs")
+    seen_paths, seen_names, found = set(), set(), []
+    for root in skill_roots(world):
+        try:
+            entries = sorted(fs.listdir(root))
+        except OSError:
+            continue
+        for entry in entries:
+            path = os.path.join(root, entry, "SKILL.md")
+            if not fs.isfile(path):
+                continue
+            phys = fs.realpath(path)
+            if phys in seen_paths:
+                continue
+            seen_paths.add(phys)
+            name, desc = skill_meta(world, path)
+            if name in seen_names:
+                world.get("stderr").write("wisp: dropping skill %s at %s\n" % (name, phys))
+                continue
+            seen_names.add(name)
+            found.append((name, desc, phys))
+    return sorted(found)
+
+
+def resolve_skill_path(world: World, name: str) -> str:
+    for skill_name, _desc, path in collect_skills(world):
+        if skill_name == name:
+            return path
+    return ""
+
+
+def skill_meta(world: World, path: str) -> tuple:
+    """(name, description) from SKILL.md frontmatter.
+
+    Handles plain, quoted, and block-scalar descriptions. The name falls
+    back to the parent directory name.
+    """
+    name = desc = ""
+    in_fm = block = False
+    for line in world.get("fs").read_text(path).split("\n"):
+        if not in_fm:
+            if line == "---":
+                in_fm = True
+            continue
+        if line == "---":
+            break
+        if block:
+            if not line.strip():
+                continue
+            if line[:1] in (" ", "\t"):
+                word = line.strip()
+                desc = (desc + " " + word) if desc else word
+                continue
+            block = False
+        field, _, value = line.partition(":")
+        if field == "name":
+            name = value.strip().strip("\"'")
+        elif field == "description":
+            value = value.strip()
+            if value in ("|", "|-", ">", ">-"):
+                block = True
+                desc = ""
+            else:
+                desc = value.strip("\"'")
+    if not name:
+        name = os.path.basename(os.path.dirname(path))
+    return name, desc
+
+
+def strip_frontmatter(world: World, path: str) -> str:
+    """The SKILL.md body with the frontmatter removed; a file that does
+    not start with --- passes through unchanged."""
+    lines = world.get("fs").read_text(path).split("\n")
+    if not lines or lines[0] != "---":
+        return "\n".join(lines)
+    body, started = [], False
+    for line in lines[1:]:
+        if not started and line == "---":
+            started = True
+            continue
+        if started:
+            body.append(line)
+    return "\n".join(body)
+
+
+def skill_block(world: World, name: str, path: str) -> str:
+    """The <skill> block; the exact text a system prompt carries."""
+    body = strip_frontmatter(world, path).strip()
+    return ('<skill name="%s" location="%s">\nReferences are relative to %s.\n\n%s\n</skill>'
+            % (name, path, os.path.dirname(path), body))
+
+
+def agents_md_files(world: World) -> list:
+    """AGENTS.md and AGENTS.local.md files in ascending-priority
+    order: the user files first, then the cwd ancestors from the root
+    directory down to the CWD. When one directory holds both files,
+    AGENTS.local.md goes after AGENTS.md. Later text carries more
+    weight in LLMs, so the deepest, most project-local file sits
+    last. Deduped by physical path with the first copy kept."""
+    fs, env = world.get("fs"), world.get("env")
+    docs = []
+    home = os.path.join(home_dir(env), ".agents")
+    for name in ("AGENTS.md", "AGENTS.local.md"):
+        home_doc = os.path.join(home, name)
+        if fs.isfile(home_doc):
+            docs.append(home_doc)
+    d = fs.cwd()
+    stack = []
+    while True:
+        found = []
+        for name in ("AGENTS.md", "AGENTS.local.md"):
+            candidate = os.path.join(d, name)
+            if fs.isfile(candidate):
+                found.append(candidate)
+        if found:
+            stack.append(found)
+        if d == os.path.dirname(d):
+            break
+        d = os.path.dirname(d)
+    for found in reversed(stack):
+        docs.extend(found)
+    unique, seen = [], set()
+    for path in docs:
+        phys = fs.realpath(path)
+        if phys in seen:
+            continue
+        seen.add(phys)
+        unique.append(path)
+    return unique
+
+
+# --- renderer -----------------------------------------------------------------
+
+THINK_LABEL = "[think]\n"
+ANSWER_LABEL = "[answer]\n"
+
+
+class Renderer:
+    """Renders the run stdout stream (raw SSE plus injected tool records)
+    to plain text: a `[think]` marker line opens each thinking block, an
+    `[answer]` marker line opens each output block, each tool-call header
+    stands alone with the command below it, and a 🟢/🔴 exit dot line
+    precedes each tool result, no colors. render-past replays committed
+    system and user records through the prompt() path     `[system]`
+    or `[user]` marker line; the live stream never carries one. A
+    steered user record replays through the steer() path as a `[steer]`
+    marker line, the same shape the live drain injected."""
+
+    def __init__(self, world: World):
+        self._world = world
+        self._think_fields = (
+            world.get("env").get("WISP_THINK_FIELDS", DEFAULT_THINK_FIELDS).split(",")
+        )
+        self._out = world.get("stdout")
+        self._last_kind = None
+        self._labeled = False
+        self._open_line = False
+
+    def _before(self, kind: str) -> None:
+        """One blank separator pair and a fresh label when the kind changes."""
+        if self._last_kind is not None and self._last_kind != kind:
+            self._out.write("\n\n")
+            self._labeled = False
+        self._last_kind = kind
+
+    def _emit(self, label: str, text: str) -> None:
+        """Open the block with its label once, then write the chunk raw."""
+        if not self._labeled:
+            self._out.write(label)
+            self._labeled = True
+        self._out.write(text)
+        self._open_line = not text.endswith("\n")
+
+    def render_line(self, line: str) -> None:
+        if not line.startswith("data:"):
+            return
+        text = line[len("data:"):].lstrip()
+        if not text or text == "[DONE]":
+            return
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            return
+        if not isinstance(payload, dict):
+            return
+        marker = payload.get("wisp")
+        if marker == "tool_call":
+            self.tool_header(payload)
+        elif marker == "tool_result":
+            self.tool_result(payload)
+        elif marker == "prompt":
+            self.prompt(payload)
+        elif marker == "steer":
+            self.steer(payload)
+        elif "choices" in payload:
+            self.chunk(payload)
+
+    def chunk(self, payload: dict) -> None:
+        delta = next(iter(payload.get("choices") or []), {}).get("delta") or {}
+        think = next((delta[f] for f in self._think_fields if delta.get(f)), "")
+        if think:
+            self._before("reasoning")
+            self._emit(THINK_LABEL, think)
+        content = delta.get("content")
+        if content:
+            self._before("text")
+            self._emit(ANSWER_LABEL, content)
+
+    def tool_header(self, payload: dict) -> None:
+        """The [name 5s 5kb] command pretty print; a call with broken
+        arguments shows ?s ?kB and the raw argument text."""
+        name = payload.get("name", "tool")
+        seconds = payload.get("timeoutSeconds", DEFAULT_TOOL_TIMEOUT)
+        maxkb = payload.get("maxKilobytes", DEFAULT_TOOL_MAXKB)
+        command = payload.get("command", "")
+        self._before("tool_call")
+        if name == "load_image":
+            self._out.write("[load_image]\n")
+        else:
+            self._out.write("[%s %ss %skb]\n" % (name, seconds, maxkb))
+        if command:
+            self._out.write(command + "\n")
+        self._open_line = False
+
+    def tool_result(self, payload: dict) -> None:
+        exit_code = payload.get("exit", 0)
+        dot = "🟢" if exit_code == 0 else "🔴"
+        self._out.write("%s %s\n" % (dot, exit_code))
+        content = payload.get("content", "")
+        self._out.write(content if content.endswith("\n") else content + "\n")
+        for att in payload.get("attachments") or []:
+            self._out.write("[attachment: %s, %s]\n"
+                            % (att.get("name", ""), att.get("media_type", "")))
+        # A tool result may leave a color or other SGR state active at its
+        # end (the command never reset it, or the output cap cut off its
+        # reset).  Close that state so it cannot bleed into later render
+        # output.  ESC[0m with no active attributes is a no-op.
+        self._out.write("\x1b[0m\n")
+        self._last_kind = "tool_result"
+        self._labeled = False
+        self._open_line = False
+
+    def prompt(self, payload: dict) -> None:
+        """A committed prompt record: one `[role]` marker line, content below."""
+        role = payload.get("role", "user")
+        self._before(role)
+        self._emit("[%s]\n" % role, payload.get("content", ""))
+
+    def steer(self, payload: dict) -> None:
+        """A steering message: one `[steer]` marker line, content below.
+        The same shape as prompt, its own kind, so a steer never joins
+        a user block above it."""
+        self._before("steer")
+        self._emit("[steer]\n", payload.get("content", ""))
+
+    def finish(self) -> None:
+        if self._open_line:
+            self._out.write("\n")
+        self._last_kind = None
+
+
+def records_to_stream(records: list) -> Iterator[str]:
+    """Yield one `data:` line per renderer payload, in the order the
+    live stream carried it.
+
+    Tools run sequentially in block order, so result N sits between
+    header N and header N+1. Call headers are held back at the
+    assistant record and released at their result's position, paired by
+    call_id; a result with no id match takes the oldest pending header.
+    A leftover header (a killed run's missing result) is released before
+    the next record, where its command ran. A steered user record
+    yields the steer payload the live drain injected, so render-past
+    shows it with its [steer] marker."""
+    def emit(payload: dict) -> str:
+        return "data: %s\n" % json.dumps(payload, ensure_ascii=False)
+
+    pending = []  # (call_id, inject payload) awaiting their result
+    for rec in records:
+        kind = rec.get("type")
+        if kind != "tool" and pending:
+            for _call_id, payload in pending:
+                yield emit(payload)
+            pending = []
+        if kind == "assistant":
+            for block in rec.get("output") or []:
+                btype = block.get("type")
+                if btype == "reasoning":
+                    yield emit({"choices": [{"delta": {"reasoning_content": block.get("text", "")}}]})
+                elif btype == "text":
+                    yield emit({"choices": [{"delta": {"content": block.get("text", "")}}]})
+                elif btype == "tool_call":
+                    pending.append((block.get("id"), tool_call_inject(block)))
+        elif kind in ("user", "system"):
+            if kind == "user" and rec.get("wisp_steered"):
+                yield emit({"wisp": "steer", "content": rec.get("content", "")})
+            else:
+                content = rec.get("content", "")
+                for att in rec.get("attachments") or []:
+                    content += "\n[attachment: %s, %s]" % (
+                        att.get("name", ""), att.get("media_type", ""))
+                yield emit({"wisp": "prompt", "role": kind,
+                            "content": content})
+        elif kind == "tool":
+            call_id = rec.get("call_id")
+            if pending:
+                indexes = [i for i, (cid, _p) in enumerate(pending) if cid == call_id]
+                yield emit(pending.pop(indexes[0] if indexes else 0)[1])
+            payload = {"wisp": "tool_result", "name": rec.get("name", ""),
+                       "call_id": call_id, "content": rec.get("content", ""),
+                       "exit": rec.get("exit", 0)}
+            if rec.get("attachments"):
+                payload["attachments"] = [
+                    {"name": att.get("name", ""),
+                     "media_type": att.get("media_type", "")}
+                    for att in rec["attachments"]]
+            yield emit(payload)
+    for _call_id, payload in pending:
+        yield emit(payload)
+
+
+def tool_call_inject(block: dict) -> dict:
+    """Recompute the tool_call inject payload from a stored block, with
+    the same defaults and fallbacks Tools._execute_one used when it ran:
+    ?s ?kB and the raw argument text when the arguments do not parse."""
+    name = block.get("name") or ""
+    try:
+        args = json.loads(block.get("arguments") or "")
+    except ValueError:
+        args = None
+    command = args.get("command") if isinstance(args, dict) else None
+    if name == "load_image":
+        path = args.get("path") if isinstance(args, dict) else None
+        return {"wisp": "tool_call", "name": name,
+                "command": path if isinstance(path, str) else ""}
+    if name in ("bash", "python3") and isinstance(command, str):
+        return {"wisp": "tool_call", "name": name,
+                "timeoutSeconds": _int_or(args.get("timeoutSeconds"), DEFAULT_TOOL_TIMEOUT),
+                "maxKilobytes": _int_or(args.get("maxKilobytes"), DEFAULT_TOOL_MAXKB),
+                "command": command}
+    return {"wisp": "tool_call", "name": name,
+            "timeoutSeconds": "?", "maxKilobytes": "?",
+            "command": command if isinstance(command, str)
+            else (block.get("arguments") or "")}
+
+
+IMPLS: dict[str, Callable[[World], Any]] = {
+    "stdout": lambda w: Stdio(sys.stdout),
+    "stderr": lambda w: Stdio(sys.stderr),
+    "stdin": lambda w: StdinFile(sys.stdin),
+    "env": env_impl,
+    "fs": Fs,
+    "clock": Clock,
+    "rng": Rng,
+    "http": Http,
+    "exec": Executor,
+    "session": Session,
+    "llm": Llm,
+    "tools": Tools,
+    "context_guard": lambda w: None,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    world = World(IMPLS)
+    cmd = argv[0] if argv else "<none>"
+    rc = 1
+    try:
+        if not argv or argv[0] in ("-h", "--help"):
+            world.get("stdout").write(__doc__)
+            rc = 0
+        else:
+            cmd, opts = parse_args(world, argv)
+            rc = COMMANDS[cmd](world, opts)
+    except BrokenPipeError:
+        # The reader closed the pipe, the usual "wisp ls | head". Point
+        # fd 1 at devnull so the interpreter's exit flush cannot raise a
+        # second time, and exit 141, the SIGPIPE convention (128 + 13).
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY),
+                    sys.stdout.fileno())
+        except (AttributeError, OSError, ValueError):
+            pass  # stdout without a real fd needs no redirect
+        rc = 141
+    except SignalExit as exc:
+        world.get("stderr").write(
+            "wisp: signal %s; committed wisp.jsonl; exit %s\n"
+            % (exc.signum, 128 + exc.signum))
+        rc = 128 + exc.signum
+    except KeyboardInterrupt:
+        # Ctrl-C: the run loop's finally already committed the tail;
+        # exit 130, the SIGINT convention, without a traceback.
+        world.get("stderr").write(
+            "wisp: signal 2; committed wisp.jsonl; exit 130\n")
+        rc = 130
+    except HttpError as exc:
+        fail(world, "http error: %s" % exc)
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else 1
+    except Exception:
+        # One unhandled crash: the traceback goes to wisp.log as one
+        # crash line, so a dead run leaves the cause on disk even when
+        # stderr is lost; the exit line in the finally then closes it.
+        safe_log(world, "crash", traceback.format_exc().replace("\n", " | ")[:4000])
+        world.get("stderr").write(
+            "wisp: internal error; the traceback is in wisp.log\n")
+        rc = 1
+    finally:
+        safe_log(world, "exit", "cmd=%s" % cmd,
+                 "pid=%s" % os.getpid(), "rc=%s" % rc)
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

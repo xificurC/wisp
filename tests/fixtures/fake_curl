@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# Mock curl for the wisp provider tests.
+# Ignores its arguments except it captures the -d @BODY request body.
+# Emits canned SSE on stdout, chosen by invocation count.
+# FAKE_MODE values:
+#   always-tools : always return a tool call
+#   fail-tool    : return a tool call whose command exits non-zero
+#   two-tools    : return two tool calls in one turn
+#   oversize-tool: return a tool call whose output exceeds maxKilobytes
+#   hang-tool    : return a tool call that hangs until timeoutSeconds
+#   python3-tool : return a python3 tool call that prints a marker
+#   cat-pidfile   : return one bash tool call `cat "$FAKE_PIDFILE"`
+#   usage-nodetails: final answer plus a usage chunk with no
+#                  prompt_tokens_details (the live glm shape)
+
+n=0
+[ -f "$FAKE_COUNT" ] && n=$(cat "$FAKE_COUNT")
+
+# If this is the model/info fetch, respond with model metadata JSON and exit
+# before the chat-completions count logic. The model id is m1, matching the
+# tests. FAKE_MODE=fail-model-info makes the fetch fail so the run proceeds
+# without a modelcfg file.
+for a in "$@"; do
+    case "$a" in
+        *model/info*)
+            # Emulate curl -o FILE: write the response to the file given after
+            # -o, not to stdout. Real curl does this; run_turn reads chat
+            # completions from stdout, but fetch_model_cfg uses -o for model
+            # info, so fake_curl must match.
+            local_out=""
+            prev=""
+            for oa in "$@"; do
+                if [ "$prev" = "-o" ]; then local_out="$oa"; fi
+                prev="$oa"
+            done
+            if [ "$FAKE_MODE" = "fail-model-info" ]; then
+                body='{"error":{"message":"denied"}}'
+            else
+                body='{"data":[{"model_name":"m1","model_info":{"max_input_tokens":100000,"input_cost_per_token":3e-8,"output_cost_per_token":3e-7,"cache_read_input_token_cost":3e-8,"cache_creation_input_token_cost":null}}]}'
+            fi
+            if [ -n "$local_out" ]; then
+                printf '%s\n' "$body" > "$local_out"
+            else
+                printf '%s\n' "$body"
+            fi
+            exit 0
+            ;;
+    esac
+done
+
+# Save the count before the increment: with FAKE_CAPTURE_BODY_DIR set, each
+# chat-completions body lands as body-<n>.json indexed from zero
+# (body-0.json is the first), mirroring the probe mock layout.
+n_prev="${n:-0}"
+n=$((n + 1))
+printf '%s' "$n" >"$FAKE_COUNT"
+
+# Capture the request body so tests can inspect the messages array.
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "-d" ]; then
+        cp "${a#@}" "$FAKE_CAPTURE" 2>/dev/null
+        if [ -n "${FAKE_CAPTURE_BODY_DIR:-}" ]; then
+            cp "${a#@}" "$FAKE_CAPTURE_BODY_DIR/body-$n_prev.json" 2>/dev/null
+        fi
+    fi
+    prev="$a"
+done
+
+done_line() {
+    printf 'data: %s\n\n' "[DO""NE]"
+}
+
+tool_call_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","function":{"arguments":"","name":"bash"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\\"command\\": \\"%s\\"}"},"type":"function","index":0}]}}]}\n\n' "$1"
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    done_line
+}
+
+final_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"content":"final answer"}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    done_line
+}
+
+# A compaction summary turn: a final answer with distinctive content and no
+# tool call. The compaction test uses this so the summary is
+# recognizable in the rewritten log.
+summary_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"content":"compacted summary of the last turn"}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    done_line
+}
+
+# A tool call whose arguments set maxKilobytes. The command fills far more
+# than the cap, so the oversize path must fire.
+oversize_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","function":{"arguments":"","name":"bash"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\\\"command\\\": \\\"seq 1 100000\\\", \\\"maxKilobytes\\\": 5}"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    done_line
+}
+
+# A tool call whose arguments set timeoutSeconds. The command sleeps longer
+# than the timeout, so the timeout path must fire.
+hang_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","function":{"arguments":"","name":"bash"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\\\"command\\\": \\\"sleep 10\\\", \\\"timeoutSeconds\\\": 1}"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    done_line
+}
+
+# A final answer followed by a usage chunk. The usage chunk carries
+# prompt_tokens_details.cached_tokens so the cache log line is testable.
+# It is one extra data line after the finish_reason line, like a real
+# stream with stream_options.include_usage.
+cache_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"content":"cached answer"}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    done_line
+    printf 'data: {"choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":10,"prompt_tokens":100,"total_tokens":110,"prompt_tokens_details":{"cached_tokens":40}}}\n\n'
+}
+
+# A final answer plus a usage chunk in the live glm shape: no
+# prompt_tokens_details key at all. Live sample shape: completion_tokens,
+# prompt_tokens, total_tokens, completion_tokens_details.reasoning_tokens.
+usage_nodetails_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"content":"final answer"}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+    done_line
+    printf 'data: {"choices":[{"index":0,"delta":{}}],"usage":{"completion_tokens":10,"prompt_tokens":100,"total_tokens":110,"completion_tokens_details":{"reasoning_tokens":0}}}\n\n'
+}
+
+# A tool call whose name is python3. The command is valid Python and
+# invalid bash, so the test can prove python3, not bash, runs it.
+python3_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","function":{"arguments":"","name":"python3"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\\"command\\": \\\"%s\\\"}"},"type":"function","index":0}]}}]}\n\n' "print('py_ok_123')"
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    done_line
+}
+
+# Emit two tool calls, index 0 and index 1, in one turn. Each delta block
+# carries one tool call so accumulate_tool_calls merges them by index.
+two_tool_sse() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","function":{"arguments":"","name":"bash"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\\"command\\": \\\"%s\\\"}"},"type":"function","index":0}]}}]}\n\n' "$1"
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_2","function":{"arguments":"","name":"bash"},"type":"function","index":1}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\\"command\\": \\\"%s\\\"}"},"type":"function","index":1}]}}]}\n\n' "$2"
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    done_line
+}
+
+# One bash tool call: `cat "$FAKE_PIDFILE"`. The double quotes of the
+# command are JSON-escaped here, so the arguments JSON parses and the
+# executor's `bash -c` still sees its own quotes over $FAKE_PIDFILE.
+cat_pidfile_sse() {
+    args='{\"command\": \"cat \\\"$FAKE_PIDFILE\\\"\"}'
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","function":{"arguments":"","name":"bash"},"type":"function","index":0}]}}]}
+
+'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"%s"},"type":"function","index":0}]}}]}
+
+' "$args"
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+'
+    done_line
+}
+
+# A non-SSE error body, the shape a 403 access-denied returns. It is plain
+# JSON, not data: lines. The hardened reader must detect it and fail loud.
+error_json() {
+    printf '%s\n' '{"error":{"message":"key not allowed to access model","type":"auth_error","code":"key_model_access_denied"}}'
+}
+
+# A non-SSE plain-text error body, the shape a proxy returns when it blocks
+# a request. It is not JSON and not data: lines. The inverted validation
+# must reject it and fail loud with the raw first line.
+error_text() {
+    printf '%s\n' 'Forbidden'
+}
+
+case "$FAKE_MODE" in
+    always-tools)  tool_call_sse 'echo mock-out' ;;
+    fail-tool)     tool_call_sse 'exit 3' ;;
+    two-tools)     two_tool_sse 'echo mock-out-1' 'echo mock-out-2' ;;
+    oversize-tool) oversize_sse ;;
+    hang-tool)     hang_sse ;;
+    python3-tool)  python3_sse ;;
+    cat-pidfile)
+        # Spec 1.4 D5: the first turn returns one bash tool call that cats
+        # the pid file. The tool executor's bash expands $FAKE_PIDFILE at
+        # tool-run time, so the pid file contents ride back as the tool
+        # result and land in $FAKE_CAPTURE on the next request. Later turns
+        # close the run with a final answer. `tool_call_sse' cannot carry
+        # this command: it does not JSON-escape the quotes inside the
+        # command, so the arguments JSON would not parse. The emitter below
+        # escapes them by hand.
+        if [ "$n" -eq 1 ]; then
+            cat_pidfile_sse
+        else
+            final_sse
+        fi
+        ;;
+    cache)         cache_sse ;;
+    usage-nodetails) usage_nodetails_sse ;;
+    summary)       summary_sse ;;
+    error-json)    error_json ;;
+    error-text)    error_text ;;
+    *)
+        if [ "$n" -eq 1 ]; then
+            tool_call_sse 'echo mock-out'
+        else
+            final_sse
+        fi
+        ;;
+esac

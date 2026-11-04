@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Mock curl that streams reasoning_content before content/tool calls. Turn 1
+# is a tool call, turn 2+ is a final answer. Proves the collapse keeps
+# reasoning in the output array and the transform replays it as
+# reasoning_content on the wire.
+n=0
+[ -f "$FAKE_COUNT" ] && n=$(cat "$FAKE_COUNT")
+
+# model/info fetch: write a valid response to the -o file and exit before the
+# chat-completions count logic, so it does not consume a turn.
+for a in "$@"; do
+    case "$a" in
+        *model/info*)
+            local_out=""
+            prev=""
+            for oa in "$@"; do
+                if [ "$prev" = "-o" ]; then local_out="$oa"; fi
+                prev="$oa"
+            done
+            body='{"data":[{"model_name":"m1","model_info":{"max_input_tokens":100000,"input_cost_per_token":3e-8,"output_cost_per_token":3e-7}}]}'
+            if [ -n "$local_out" ]; then
+                printf '%s\n' "$body" > "$local_out"
+            else
+                printf '%s\n' "$body"
+            fi
+            exit 0
+            ;;
+    esac
+done
+
+n=$((n + 1))
+printf '%s' "$n" >"$FAKE_COUNT"
+
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "-d" ]; then
+        cp "${a#@}" "$FAKE_CAPTURE" 2>/dev/null
+    fi
+    prev="$a"
+done
+
+reason() {
+    printf 'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"reasoning_content":"let me think"}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"reasoning_content":" some more"}}]}\n\n'
+}
+
+if [ "$n" -eq 1 ]; then
+    reason
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","function":{"arguments":"","name":"bash"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"{\\"command\\": \\\"echo mock-out\\\"}"},"type":"function","index":0}]}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+else
+    reason
+    printf 'data: {"choices":[{"index":0,"delta":{"content":"final answer"}}]}\n\n'
+    printf 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+fi
+printf 'data: %s\n\n' "[DO""NE]"

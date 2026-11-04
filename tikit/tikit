@@ -1,0 +1,773 @@
+#!/bin/bash
+# tikit - portable ticket management (create / query)
+#
+# A bash 3.2 compatible front-end. Bash does argument parsing and dispatch;
+# all YAML parsing, JSON emission, and SQLite work is delegated to python3
+# (standard library only). Requires python3.
+
+# ---- python availability -----------------------------------------------------
+have_python3() {
+    command -v python3 >/dev/null 2>&1
+}
+
+die_no_python() {
+    echo "error: python3 is required but was not found on PATH" >&2
+    exit 1
+}
+
+# ---- ticket directory --------------------------------------------------------
+resolve_ticket_dir() {
+    # Resolves from TIKIT_DIR if set and non-empty, else ./.tickets.
+    # Prints an absolute path.
+    local dir
+    if [ -n "${TIKIT_DIR:-}" ]; then
+        dir="$TIKIT_DIR"
+    else
+        dir="./.tickets"
+    fi
+    # Normalize to absolute, following symlinks.
+    if [ -d "$dir" ]; then
+        ( cd "$dir" && pwd -P )
+    else
+        # Does not exist yet: resolve relative to cwd.
+        case "$dir" in
+            /*) printf '%s' "$dir" ;;
+            *)  printf '%s' "$(pwd -P)/$dir" ;;
+        esac
+    fi
+}
+
+# ---- id generation -----------------------------------------------------------
+gen_slug() {
+    # First 4 chars of cwd basename, case-preserving (NOT lowercased).
+    local base="${PWD##*/}"
+    printf '%s' "${base:0:4}"
+}
+
+gen_code() {
+    # 6 lowercase-alnum chars from /dev/urandom.
+    tr -dc 'a-z0-9' </dev/urandom | head -c6
+}
+
+gen_id() {
+    printf '%s-%s' "$(gen_slug)" "$(gen_code)"
+}
+
+# ---- top-level dispatch ------------------------------------------------------
+print_top_help() {
+    cat <<'EOF'
+usage: tikit <command> [options]
+
+commands:
+  create   Create a new ticket.
+  query    Find and print tickets.
+
+options:
+  -h, --help   Show this help.
+
+environment:
+  TIKIT_DIR   Directory for tickets (default: ./.tickets)
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        create)
+            shift
+            cmd_create "$@"
+            ;;
+        query)
+            shift
+            cmd_query "$@"
+            ;;
+        -h|--help|"")
+            print_top_help
+            exit 0
+            ;;
+        *)
+            echo "error: unknown command: $cmd" >&2
+            echo "try 'tikit --help'" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# ---- create ------------------------------------------------------------------
+print_create_help() {
+    cat <<'EOF'
+usage: tikit create [--key value ...] [--id <id>] [--name <name>] [--status <s>]
+
+Create a new ticket under <ticketdir>/<id>/ticket.md.
+
+  --key value   Set a frontmatter key to value. Values may be scalars or, when
+                wrapped in colons with length>2 (e.g. :a:b:), lists.
+  --id <id>     Override the auto-generated id.
+  --name <name> Set the ticket name (default: empty).
+  --status <s>  Set the status (default: open).
+  -h, --help    Show this help.
+
+The created ticket's absolute path is printed.
+EOF
+}
+
+cmd_create() {
+    have_python3 || die_no_python
+
+    # Collect override key/value pairs as newline records "key\tvalue".
+    # The four well-known keys (id, name, status, created) are tracked
+    # separately so they keep fixed positions; everything else follows in
+    # CLI order.
+    local id_override=""
+    local name_override=""
+    local status_override=""
+    local created_override=""
+    local extra_args=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                print_create_help
+                exit 0
+                ;;
+            --)
+                shift
+                # remaining are unexpected positionals
+                if [ $# -gt 0 ]; then
+                    echo "error: unexpected argument: $1" >&2
+                    exit 1
+                fi
+                ;;
+            --*)
+                # a key; the next arg is its value
+                key="${1#--}"
+                if [ -z "$key" ]; then
+                    echo "error: empty key: $1" >&2
+                    exit 1
+                fi
+                shift
+                if [ $# -eq 0 ]; then
+                    echo "error: --$key requires a value" >&2
+                    exit 1
+                fi
+                value="$1"
+                shift
+                case "$key" in
+                    id)      id_override="$value" ;;
+                    name)    name_override="$value" ;;
+                    status)  status_override="$value" ;;
+                    created) created_override="$value" ;;
+                    *)
+                        extra_args+=("$key" "$value")
+                        ;;
+                esac
+                ;;
+            *)
+                echo "error: unexpected argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # Determine id and created.
+    if [ -n "$id_override" ]; then
+        id="$id_override"
+    else
+        id="$(gen_id)"
+    fi
+    if [ -n "$created_override" ]; then
+        created="$created_override"
+    else
+        created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    fi
+
+    local ticketdir
+    ticketdir="$(resolve_ticket_dir)"
+
+    # Build ordered key/value pairs for python: id, name, status, created,
+    # then extra keys in CLI order. The list/scalar decision is made by python
+    # so all YAML emission logic lives in one place.
+    local spec_args=()
+    spec_args+=("id" "$id")
+    spec_args+=("name" "${name_override:-}")
+    spec_args+=("status" "${status_override:-open}")
+    spec_args+=("created" "$created")
+    spec_args+=("${extra_args[@]}")
+
+    # Delegate file creation + YAML emission to python.
+    python3 - "$ticketdir" "$id" "${spec_args[@]}" <<'PYEOF'
+import os, re, sys
+
+def is_list(v):
+    return len(v) > 2 and v.startswith(':') and v.endswith(':')
+
+def parse_list(v):
+    # v is like :a:b: -> [a, b]
+    inner = v[1:-1]  # strip leading and trailing ':'
+    if inner == '':
+        return ['']
+    return inner.split(':')
+
+def yaml_single_quote(s):
+    return "'" + s.replace("'", "''") + "'"
+
+def emit_scalar(v):
+    return yaml_single_quote(v)
+
+def emit_value(v):
+    # Handle None (null) - emit literally as 'null' without quotes
+    if v is None:
+        return 'null'
+    # Handle empty list - emit literally as '[]' without quotes
+    if isinstance(v, list) and len(v) == 0:
+        return '[]'
+    if is_list(v):
+        items = parse_list(v)
+        return '[' + ', '.join(emit_scalar(i) for i in items) + ']'
+    return emit_scalar(v)
+
+def main():
+    ticketdir = sys.argv[1]
+    tid = sys.argv[2]
+    # Read specs as alternating key/value pairs from argv[3:].
+    specs_dict = {}
+    pairs = sys.argv[3:]
+    for i in range(0, len(pairs) - 1, 2):
+        specs_dict[pairs[i]] = pairs[i+1]
+
+    # Build ordered frontmatter keys: id, name, status, created, parent, blocked-on, then extras
+    ordered_keys = ['id', 'name', 'status', 'created']
+    if 'parent' not in specs_dict:
+        specs_dict['parent'] = None
+    if 'blocked-on' not in specs_dict:
+        specs_dict['blocked-on'] = []
+    ordered_keys.extend(['parent', 'blocked-on'])
+    # Add any extra keys (not in builtin list)
+    for k in specs_dict:
+        if k not in ordered_keys:
+            ordered_keys.append(k)
+
+    # Build frontmatter lines in order.
+    lines = ['---']
+    for k in ordered_keys:
+        v = specs_dict[k]
+        lines.append(k + ': ' + emit_value(v))
+    lines.append('---')
+
+
+    content = '\n'.join(lines) + '\n'
+
+    folder = os.path.join(ticketdir, tid)
+    try:
+        os.makedirs(folder)
+    except FileExistsError:
+        pass
+    except OSError as e:
+        sys.stderr.write('error: cannot create ticket directory %s: %s\n' % (folder, e))
+        sys.exit(1)
+    path = os.path.join(folder, 'ticket.md')
+    try:
+        with open(path, 'w') as f:
+            f.write(content)
+    except OSError as e:
+        sys.stderr.write('error: cannot write %s: %s\n' % (path, e))
+        sys.exit(1)
+    sys.stdout.write(os.path.abspath(path) + '\n')
+
+main()
+PYEOF
+}
+
+# ---- query -------------------------------------------------------------------
+print_query_help() {
+    cat <<'EOF'
+usage: tikit query [--files|--json|--sql <query>] [--key value ...] [not ...]
+
+Find and print tickets.
+
+output modes (pick exactly one):
+  --files              Print the absolute path of each matching ticket (default).
+  --json               Print one JSON object per ticket (NDJSON, pipeable to jq).
+  --sql <query>        Run an SQL query over an in-memory tickets table.
+                       The remaining arguments are joined into the query.
+
+filters (files/json only; not allowed with --sql):
+  --key value          Match tickets whose key value matches the regex.
+  not                  Negate the next --key filter.
+  Filters are AND-composed. List values are matched as :v1:v2:.
+  A missing key fails a positive filter and passes a negated one.
+
+examples:
+  tikit query --files --status open
+  tikit query --json --not --status open
+  tikit query --sql "SELECT id FROM tickets WHERE json_extract(data,'\$.status')='open'"
+EOF
+}
+
+cmd_query() {
+    have_python3 || die_no_python
+
+    local mode=""
+    local sql_args=""
+    local sql_arg_count=0
+    local filters=""     # records: "neg\tkey\tvalue"
+    local pending_not=0
+    local sql_mode=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                print_query_help
+                exit 0
+                ;;
+            --files)
+                if [ -n "$mode" ]; then
+                    echo "error: conflicting output modes" >&2
+                    exit 1
+                fi
+                mode="files"
+                if [ "$sql_mode" -eq 1 ]; then
+                    echo "error: cannot combine --sql with --files" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+            --json)
+                if [ -n "$mode" ]; then
+                    echo "error: conflicting output modes" >&2
+                    exit 1
+                fi
+                mode="json"
+                if [ "$sql_mode" -eq 1 ]; then
+                    echo "error: cannot combine --sql with --json" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+            --sql)
+                if [ -n "$mode" ]; then
+                    echo "error: cannot combine --sql with --files/--json" >&2
+                    exit 1
+                fi
+                if [ -n "$filters" ] || [ "$pending_not" -eq 1 ]; then
+                    echo "error: cannot mix --key filters with --sql" >&2
+                    exit 1
+                fi
+                mode="sql"
+                sql_mode=1
+                shift
+                # All remaining args form the query.
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --*)
+                            # A --key filter mixed with --sql is an error.
+                            if [ "$sql_arg_count" -gt 0 ] || [ "$1" = "--sql" ] || [ "$1" = "--files" ] || [ "$1" = "--json" ]; then
+                                echo "error: cannot mix --key filters with --sql" >&2
+                                exit 1
+                            fi
+                            echo "error: cannot mix --key filters with --sql" >&2
+                            exit 1
+                            ;;
+                        *)
+                            if [ "$sql_arg_count" -eq 0 ]; then
+                                sql_args="$1"
+                            else
+                                sql_args="$sql_args $1"
+                            fi
+                            sql_arg_count=$((sql_arg_count + 1))
+                            shift
+                            ;;
+                    esac
+                done
+                ;;
+            not|--not)
+                if [ "$sql_mode" -eq 1 ]; then
+                    echo "error: cannot mix --key filters with --sql" >&2
+                    exit 1
+                fi
+                if [ "$pending_not" -eq 1 ]; then
+                    echo "error: consecutive 'not'" >&2
+                    exit 1
+                fi
+                pending_not=1
+                shift
+                ;;
+            --*)
+                # A --key filter. Not allowed in sql mode.
+                if [ "$sql_mode" -eq 1 ]; then
+                    echo "error: cannot mix --key filters with --sql" >&2
+                    exit 1
+                fi
+                key="${1#--}"
+                if [ -z "$key" ]; then
+                    echo "error: empty key: $1" >&2
+                    exit 1
+                fi
+                shift
+                if [ $# -eq 0 ]; then
+                    echo "error: --$key requires a value" >&2
+                    exit 1
+                fi
+                value="$1"
+                shift
+                neg=0
+                if [ "$pending_not" -eq 1 ]; then
+                    neg=1
+                    pending_not=0
+                fi
+                if [ -n "$filters" ]; then
+                    filters="$filters"$'\n'"$neg"$'\t'"$key"$'\t'"$value"
+                else
+                    filters="$neg"$'\t'"$key"$'\t'"$value"
+                fi
+                ;;
+            *)
+                echo "error: unexpected argument: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+
+    # A trailing 'not' with no following key is an error.
+    if [ "$pending_not" -eq 1 ]; then
+        echo "error: 'not' at end of filters" >&2
+        exit 1
+    fi
+
+    # sql mode validation: must have a non-empty query.
+    if [ "$mode" = "sql" ]; then
+        if [ "$sql_arg_count" -eq 0 ]; then
+            echo "error: --sql requires a query" >&2
+            exit 1
+        fi
+    fi
+
+    # Default mode is files.
+    if [ -z "$mode" ]; then
+        mode="files"
+    fi
+
+    local ticketdir
+    ticketdir="$(resolve_ticket_dir)"
+
+    # Delegate to python. Pass mode, sql, and filters via environment to avoid
+    # shell-quoting issues with arbitrary values.
+    PY_MODE="$mode" PY_SQL="$sql_args" PY_FILTERS="$filters" python3 - "$ticketdir" <<'PYEOF'
+import json, os, re, sqlite3, sys
+
+def unescape_double(s):
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == '\\' and i + 1 < n:
+            nxt = s[i+1]
+            if nxt == 'n': out.append('\n')
+            elif nxt == 't': out.append('\t')
+            elif nxt == '"': out.append('"')
+            elif nxt == '\\': out.append('\\')
+            else: out.append(nxt)
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+def parse_scalar(raw):
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == "'" and s[-1] == "'":
+        return s[1:-1].replace("''", "'")
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return unescape_double(s[1:-1])
+    return s
+
+def split_flow(inner):
+    elems = []
+    cur = []
+    in_s = False
+    in_d = False
+    i = 0
+    n = len(inner)
+    while i < n:
+        c = inner[i]
+        if in_s:
+            cur.append(c)
+            if c == "'":
+                if i + 1 < n and inner[i+1] == "'":
+                    cur.append("'")
+                    i += 2
+                    continue
+                in_s = False
+        elif in_d:
+            cur.append(c)
+            if c == '\\' and i + 1 < n:
+                cur.append(inner[i+1])
+                i += 2
+                continue
+            if c == '"':
+                in_d = False
+        else:
+            if c == ',':
+                elems.append(''.join(cur).strip())
+                cur = []
+                i += 1
+                continue
+            if c == "'":
+                in_s = True
+            elif c == '"':
+                in_d = True
+            cur.append(c)
+        i += 1
+    last = ''.join(cur).strip()
+    if last != '' or elems:
+        elems.append(last)
+    return elems
+
+def parse_flow(s):
+    inner = s.strip()
+    if inner.startswith('['):
+        inner = inner[1:]
+    if inner.endswith(']'):
+        inner = inner[:-1]
+    inner = inner.strip()
+    if inner == '':
+        return []
+    return [parse_scalar(e) for e in split_flow(inner)]
+
+def parse_frontmatter(lines):
+    result = {}
+    order = []
+    cur_key = None
+    for line in lines:
+        if line.strip() == '':
+            continue
+        if line[0] == ' ' or line[0] == '\t':
+            st = line.strip()
+            if st.startswith('- '):
+                if cur_key is not None:
+                    if not isinstance(result.get(cur_key), list):
+                        result[cur_key] = []
+                    result[cur_key].append(parse_scalar(st[2:]))
+            continue
+        if ':' in line:
+            key, _, rest = line.partition(':')
+            key = key.strip()
+            cur_key = key
+            rs = rest.strip()
+            if rs == '':
+                result[key] = ''
+                if key not in order:
+                    order.append(key)
+            elif rs.startswith('['):
+                result[key] = parse_flow(rs)
+                if key not in order:
+                    order.append(key)
+            else:
+                result[key] = parse_scalar(rs)
+                if key not in order:
+                    order.append(key)
+    return result, order
+
+def parse_ticket(path):
+    try:
+        with open(path, 'r') as f:
+            content = f.read()
+    except OSError:
+        return None, None, None
+    # Normalize CRLF.
+    content = content.replace('\r\n', '\n').replace('\r', '\n')
+    lines = content.split('\n')
+    if not lines or lines[0].strip() != '---':
+        return None, None, None
+    fm_lines = []
+    i = 1
+    while i < len(lines) and lines[i].strip() != '---':
+        fm_lines.append(lines[i])
+        i += 1
+    body_lines = lines[i+1:] if i < len(lines) else []
+    body = '\n'.join(body_lines)
+    fm, order = parse_frontmatter(fm_lines)
+    return fm, order, body
+
+def load_tickets(ticketdir):
+    """Return list of dicts {id, _body, data, path, fm, order} deduped by id."""
+    by_id = {}
+    order_of_ids = []
+    def add(fm, order, body, path):
+        tid = fm.get('id', '')
+        if tid in by_id:
+            return
+        rec = {
+            'fm': fm,
+            'order': order,
+            'body': body,
+            'path': path,
+        }
+        by_id[tid] = rec
+        order_of_ids.append(tid)
+    # Subfolder layout: <ticketdir>/<id>/ticket.md
+    if os.path.isdir(ticketdir):
+        for name in sorted(os.listdir(ticketdir)):
+            sub = os.path.join(ticketdir, name)
+            tp = os.path.join(sub, 'ticket.md')
+            if os.path.isfile(tp):
+                fm, order, body = parse_ticket(tp)
+                if fm is not None:
+                    add(fm, order, body, os.path.abspath(tp))
+    # Legacy flat layout: <ticketdir>/<id>.md
+    if os.path.isdir(ticketdir):
+        for name in sorted(os.listdir(ticketdir)):
+            if name.endswith('.md') and name != 'ticket.md':
+                fp = os.path.join(ticketdir, name)
+                if os.path.isfile(fp):
+                    fm, order, body = parse_ticket(fp)
+                    if fm is not None and fm.get('id', '') != '':
+                        add(fm, order, body, os.path.abspath(fp))
+    result = []
+    for tid in order_of_ids:
+        rec = by_id[tid]
+        result.append(rec)
+    return result
+
+def list_to_str(v):
+    if isinstance(v, list):
+        return ':' + ':'.join(str(x) for x in v) + ':'
+    return '' if v is None else str(v)
+
+def fm_to_json_obj(fm, order):
+    """Build a JSON-serializable dict with all frontmatter keys (lists->arrays,
+    scalars->strings), preserving key order."""
+    obj = {}
+    for k in order:
+        v = fm.get(k)
+        if isinstance(v, list):
+            obj[k] = [str(x) for x in v]
+        elif v is None:
+            obj[k] = ''
+        else:
+            obj[k] = str(v)
+    # Include any keys present in fm but missing from order (safety).
+    for k in fm:
+        if k not in obj:
+            v = fm[k]
+            if isinstance(v, list):
+                obj[k] = [str(x) for x in v]
+            elif v is None:
+                obj[k] = ''
+            else:
+                obj[k] = str(v)
+    return obj
+
+def parse_filters():
+    """Parse newline-separated 'neg\tkey\tvalue' records into a list of
+    (negated_bool, key, regex_pattern)."""
+    filters = []
+    data = os.environ.get('PY_FILTERS', '')
+    if not data:
+        return filters
+    for line in data.split('\n'):
+        if line == '':
+            continue
+        parts = line.split('\t', 2)
+        if len(parts) < 3:
+            continue
+        neg = parts[0] == '1'
+        key = parts[1]
+        value = parts[2]
+        try:
+            rx = re.compile(value)
+        except re.error:
+            rx = re.compile(re.escape(value))
+        filters.append((neg, key, rx))
+    return filters
+
+def matches(fm, filters):
+    for neg, key, rx in filters:
+        v = fm.get(key)
+        if v is None:
+            present = False
+        else:
+            present = bool(rx.search(list_to_str(v)))
+        if neg:
+            if present:
+                return False
+        else:
+            if not present:
+                return False
+    return True
+
+def main():
+    ticketdir = sys.argv[1]
+    mode = os.environ.get('PY_MODE', 'files')
+    tickets = load_tickets(ticketdir)
+
+    if mode == 'sql':
+        sql = os.environ.get('PY_SQL', '')
+        con = sqlite3.connect(':memory:')
+        cur = con.cursor()
+        # Build a table with id, _body, data (the frontmatter JSON blob) plus a
+        # TEXT column for every frontmatter key seen, so both
+        # `SELECT status FROM tickets` and `json_extract(data,'$.key')` work.
+        reserved = {'id', '_body', 'data'}
+        all_keys = []
+        seen = set()
+        for rec in tickets:
+            for k in rec['order']:
+                if k not in reserved and k not in seen:
+                    seen.add(k)
+                    all_keys.append(k)
+        def qcol(k):
+            return '"' + k.replace('"', '""') + '"'
+        col_defs = ['id TEXT', '_body TEXT', 'data TEXT']
+        for k in all_keys:
+            col_defs.append(qcol(k) + ' TEXT')
+        cur.execute('CREATE TABLE tickets (' + ', '.join(col_defs) + ')')
+        col_names = ['id', '_body', 'data'] + [qcol(k) for k in all_keys]
+        for rec in tickets:
+            obj = fm_to_json_obj(rec['fm'], rec['order'])
+            data = json.dumps(obj, ensure_ascii=False)
+            vals = [obj.get('id', ''), rec['body'], data]
+            for k in all_keys:
+                v = rec['fm'].get(k)
+                if v is None:
+                    vals.append(None)
+                elif isinstance(v, list):
+                    vals.append(json.dumps([str(x) for x in v], ensure_ascii=False))
+                else:
+                    vals.append(str(v))
+            placeholders = ', '.join(['?'] * len(col_names))
+            cur.execute('INSERT INTO tickets (' + ', '.join(col_names) + ') VALUES (' + placeholders + ')', vals)
+        try:
+            cur.execute(sql)
+            results = cur.fetchall()
+        except Exception as e:
+            sys.stderr.write('error: SQL failed: %s\n' % e)
+            sys.exit(1)
+        out = []
+        for row in results:
+            out.append('\t'.join('' if c is None else str(c) for c in row))
+        if out:
+            sys.stdout.write('\n'.join(out) + '\n')
+        con.close()
+        return
+
+    # files / json modes: apply filters.
+    filters = parse_filters()
+    selected = [rec for rec in tickets if matches(rec['fm'], filters)]
+
+    if mode == 'json':
+        for rec in selected:
+            obj = fm_to_json_obj(rec['fm'], rec['order'])
+            obj['_body'] = rec['body']
+            obj['path'] = rec['path']
+            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + '\n')
+    else:  # files
+        for rec in selected:
+            sys.stdout.write(rec['path'] + '\n')
+
+main()
+PYEOF
+}
+
+main "$@"

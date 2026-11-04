@@ -1,0 +1,1265 @@
+#!/usr/bin/env python3
+"""wispy: drive one tikit ticket through short wisp sessions.
+
+  wispy run      [--skills LIST] [flags]          < request
+  wispy continue [--skills LIST] [flags]         [< request]
+  wispy steer                                    < message
+  wispy commit   [--skills LIST] [flags]         [< brief]
+  wispy response
+
+The binding is the environment variable WISPY_TICKET. Its value is a
+path to an existing ticket.md, or a ticket id. There is no positional
+argument. An empty, unset, or unresolved value exits 2 before any
+model call. `tikit create` makes the ticket. wispy writes one ticket
+field: the status.
+
+run drives a work loop. It sets the ticket status to wip, starts one
+work session, saves the answer, distills it into the ticket and the
+state file, and starts the next session when the context guard fires.
+It stops when the work ends or the session cap is reached. The guard
+covers the work turns only: the distill turn runs with no guard, so a
+session that the guard stopped can still write its state. Each session
+is a wisp session under wisp-sessions/. The stream of the work run goes
+to stdout, so `wispy run | wisp render-live` works. The distill stream
+is silenced and noted on stderr. A closed ticket takes the same path:
+the run sets it back to wip.
+
+continue finishes the open phase that .phase names. With no text on
+stdin it runs `wisp continue`. With text it runs `wisp run`, and the
+text becomes the <request> of that turn. No marker exits 2.
+
+steer sends the whole stdin text to the session named by .phase. No
+marker exits 2, and an unfinished commit exits 2. It sends no message
+to a later session.
+
+commit runs one seal session. It reads an optional one-shot brief on
+stdin, stages the ticket's work, and makes one commit. It runs no
+test, lint, or build. It refuses while .phase holds a run of another
+kind.
+
+response prints the newest saved work response, selected by number.
+
+--skills LIST is a comma-separated list of skill names. Each name is
+read with `wisp skill read`. The persona holds the wisp block, the
+AGENTS.md chain, the skill catalog, one ticket pointer block, and the
+body of each named skill. A name with no body exits 2. A resume takes
+no --skills: wisp fixes the system prompt at `wisp new`.
+
+Flags:
+  --model M          model for every session
+  -t, --thinking T   thinking level
+  --guard P          context guard of a work run, percent (default 70)
+  --cap L            state line cap (default 100)
+  --max-sessions N   sessions this call starts (default 20)
+  --skills LIST      run, commit: skill names, comma separated
+
+Exit codes: 0 done; 1 API error; 2 usage or gate;
+75 the context guard fired at the session cap; 128+n killed; 130 after
+a caught Ctrl-c.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import signal as signal_module
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+PROG = "wispy"
+MODEL = "deepseek-v4.1-flash"
+THINKING = "xhigh"
+GUARD = 70
+CAP = 100
+MAX_SESSIONS = 20
+STEER_MAX = 16384
+
+
+# --- world ------------------------------------------------------------------
+# All IO goes through the world, never direct. A test world swaps the
+# services.
+
+class World:
+    def __init__(self, registry: dict[str, Callable[[World], Any]]):
+        self._registry = dict(registry)
+        self._cache: dict[str, Any] = {}
+
+    def get(self, name: str) -> Any:
+        if name in self._cache:
+            return self._cache[name]
+        if name not in self._registry:
+            raise KeyError(name)
+        self._cache[name] = self._registry[name](self)
+        return self._cache[name]
+
+    def set(self, name: str, value: Any) -> None:
+        self._cache[name] = value
+
+
+class Stdio:
+    """Writer for one text stream. stdout and stderr share the class."""
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+
+    def write(self, text: str) -> None:
+        self._stream.write(text)
+        self._stream.flush()
+
+
+class StdinFile:
+    """stdin through the world: the whole text, and the tty check."""
+
+    def __init__(self, stream: Any):
+        self._stream = stream
+
+    def read_text(self) -> str:
+        return self._stream.read()
+
+    def is_interactive(self) -> bool:
+        return self._stream.isatty()
+
+
+@dataclass
+class Result:
+    rc: int
+    out: str = ""
+    err: str = ""
+
+
+class CmdError(Exception):
+    """One command failure: a message for stderr and an exit code."""
+
+    def __init__(self, code: int, message: str = ""):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def note(world: World, message: str) -> None:
+    world.get("stderr").write("%s: %s\n" % (PROG, message))
+
+
+def fail(world: World, code: int, message: str) -> None:
+    raise CmdError(code, message)
+
+
+# --- io services -------------------------------------------------------------
+
+class Fs:
+    """The filesystem. Every read and write of a ticket file goes here."""
+
+    def exists(self, path: str) -> bool:
+        return os.path.exists(path)
+
+    def isdir(self, path: str) -> bool:
+        return os.path.isdir(path)
+
+    def isfile(self, path: str) -> bool:
+        return os.path.isfile(path)
+
+    def read_text(self, path: str) -> str:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+
+    def write_text(self, path: str, text: str) -> None:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def append_text(self, path: str, text: str) -> None:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def listdir(self, path: str) -> list:
+        return sorted(os.listdir(path))
+
+    def mkdir(self, path: str) -> None:
+        os.makedirs(path, exist_ok=True)
+
+    def remove(self, path: str) -> None:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+
+    def realpath(self, path: str) -> str:
+        return os.path.realpath(path)
+
+    def cwd(self) -> str:
+        return os.getcwd()
+
+
+class Exec:
+    """Run one child. `output` captures; `stream` lets stdout through."""
+
+    def __init__(self, world: World):
+        self._world = world
+
+    def output(self, argv: list, stdin_text: str = "",
+               cwd: str | None = None) -> Result:
+        try:
+            done = subprocess.run(
+                argv, input=stdin_text, capture_output=True, text=True,
+                cwd=cwd)
+        except FileNotFoundError:
+            return Result(127, "", "%s: not found" % argv[0])
+        except subprocess.TimeoutExpired:
+            return Result(124, "", "timeout")
+        return Result(done.returncode, done.stdout or "", done.stderr or "")
+
+    def stream(self, argv: list, stdin_text: str = "",
+               to_stdout: bool = True, cwd: str | None = None) -> Result:
+        out = None if to_stdout else subprocess.DEVNULL
+        try:
+            done = subprocess.run(
+                argv, input=stdin_text, stdout=out, text=True, cwd=cwd)
+        except FileNotFoundError:
+            return Result(127, "", "%s: not found" % argv[0])
+        return Result(done.returncode)
+
+
+class Signals:
+    """The wrapper owns the Ctrl-C decision. It reads its own flag."""
+
+    def __init__(self, world: World):
+        self._world = world
+        self._seen = False
+
+    def install(self) -> None:
+        try:
+            signal_module.signal(signal_module.SIGINT, self._catch)
+        except (ValueError, OSError):
+            pass
+
+    def _catch(self, signum: int, frame: Any) -> None:
+        self._seen = True
+
+    def interrupted(self) -> bool:
+        return self._seen
+
+
+# --- ticket ------------------------------------------------------------------
+
+@dataclass
+class Ticket:
+    id: str
+    name: str
+    status: str
+    path: str          # .../ticket.md
+    dir: str           # .../<id>
+    text: str
+
+
+def parse_frontmatter(text: str) -> dict:
+    """Read the YAML frontmatter as plain key/value pairs. No yaml."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}
+    out = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        out[key.strip()] = value.strip().strip("'\"")
+    return out
+
+
+class TicketService:
+    """Resolve WISPY_TICKET into one ticket, before any model call."""
+
+    def __init__(self, world: World):
+        self._world = world
+
+    def open(self, raw: str | None = None) -> Ticket:
+        world = self._world
+        if raw is None:
+            raw = world.get("env").get("WISPY_TICKET") or ""
+        raw = raw.strip()
+        if not raw:
+            fail(world, 2, "WISPY_TICKET is empty;"
+                           " set it to a ticket path or a ticket id")
+        fs = world.get("fs")
+        if "/" in raw:
+            path = raw
+            if not fs.isfile(path):
+                fail(world, 2, "WISPY_TICKET is not an existing ticket.md: %s"
+                               % raw)
+            if os.path.basename(path) != "ticket.md":
+                fail(world, 2, "WISPY_TICKET must name a file called"
+                               " ticket.md: %s" % raw)
+        else:
+            found = world.get("exec").output(
+                ["tikit", "query", "--files", "--id", raw])
+            if found.rc != 0:
+                fail(world, 2, "WISPY_TICKET: tikit query exited %d"
+                               % found.rc)
+            path = found.out.strip()
+            if not path:
+                fail(world, 2, "WISPY_TICKET: no ticket with id %s" % raw)
+            if "\n" in path:
+                fail(world, 2, "WISPY_TICKET: id %s matches several tickets"
+                               % raw)
+        path = fs.realpath(path)
+        text = fs.read_text(path)
+        meta = parse_frontmatter(text)
+        tid = meta.get("id", "")
+        if not tid:
+            fail(world, 2, "the ticket has no id in its frontmatter: %s" % path)
+        return Ticket(id=tid, name=meta.get("name", ""),
+                      status=meta.get("status", ""), path=path,
+                      dir=os.path.dirname(path), text=text)
+
+
+STATUS_FIELD = re.compile(r"status\s*:")
+
+
+def set_status(world: World, ticket: Ticket, status: str) -> None:
+    """Write the status into the frontmatter. It is the one field wispy
+    writes. The rest of the ticket stays byte for byte."""
+    fs = world.get("fs")
+    lines = fs.read_text(ticket.path).splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        fail(world, 2, "the ticket has no frontmatter: %s" % ticket.path)
+    close = None
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            close = index
+            break
+    if close is None:
+        fail(world, 2, "the ticket frontmatter does not close: %s"
+                       % ticket.path)
+    for index in range(1, close):
+        line = lines[index]
+        if STATUS_FIELD.match(line):
+            end = "\n" if line.endswith("\n") else ""
+            lines[index] = "status: '%s'%s" % (status, end)
+            fs.write_text(ticket.path, "".join(lines))
+            ticket.status = status
+            return
+    fail(world, 2, "the ticket has no status field in its frontmatter: %s"
+                   % ticket.path)
+
+
+def mark_wip(world: World, ticket: Ticket) -> None:
+    """A work session starts with status wip. A closed ticket reopens."""
+    if ticket.status == "wip":
+        return
+    was = ticket.status or "(none)"
+    set_status(world, ticket, "wip")
+    note(world, "ticket %s: status %s -> wip" % (ticket.id, was))
+
+
+# --- phases ------------------------------------------------------------------
+
+@dataclass
+class Phase:
+    kind: str          # work | distill | commit
+    seq: str
+    session: str
+    after: str = ""    # STOP | LOOP, distill only
+
+
+def phase_text(phase: Phase) -> str:
+    if phase.kind == "distill":
+        return "distill %s %s %s" % (phase.seq, phase.session,
+                                     phase.after or "STOP")
+    return "%s %s %s" % (phase.kind, phase.seq, phase.session)
+
+
+def read_phase(world: World, ticket: Ticket) -> Phase | None:
+    fs = world.get("fs")
+    path = ticket.dir + "/.phase"
+    if not fs.exists(path):
+        return None
+    parts = fs.read_text(path).split()
+    if not parts:
+        return None
+    kind = parts[0]
+    if kind not in ("work", "distill", "commit"):
+        fail(world, 2, "bad phase marker in %s: %s" % (path, kind))
+    if len(parts) < 3:
+        fail(world, 2, "bad phase marker in %s" % path)
+    phase = Phase(kind, parts[1], parts[2],
+                  parts[3].upper() if len(parts) > 3 else "")
+    if phase.kind != "commit" and not fs.isdir(phase.session):
+        fail(world, 2, "phase session dir is gone: %s; delete %s"
+                      % (phase.session, path))
+    return phase
+
+
+def write_phase(world: World, ticket: Ticket, phase: Phase) -> None:
+    world.get("fs").write_text(ticket.dir + "/.phase",
+                               phase_text(phase) + "\n")
+
+
+def clear_phase(world: World, ticket: Ticket) -> None:
+    world.get("fs").remove(ticket.dir + "/.phase")
+
+
+def decide_after_work(rc: int, interrupted: bool,
+                      has_work: bool) -> tuple:
+    """Map one work exit to the next action. Pure.
+
+    ('sigint', 0)      the user stopped it: save, keep work, exit 130
+    ('stop', 0)        distill with STOP, exit 0
+    ('loop', 0)        distill with LOOP, start the next session
+    ('api', 0)         exit 1, keep work
+    ('stop', rc)       distill with STOP, exit rc
+    ('abandon', rc)    no finished round: record, clear, exit rc
+    """
+    if interrupted:
+        return ("sigint", 0)
+    if rc == 0:
+        return ("stop", 0)
+    if rc == 75:
+        return ("loop", 0)
+    if rc == 1:
+        return ("api", 0)
+    if has_work:
+        return ("stop", rc)
+    return ("abandon", rc)
+
+
+# --- sessions ----------------------------------------------------------------
+
+class SessionService:
+    """The wisp calls of one ticket."""
+
+    def __init__(self, world: World):
+        self._world = world
+
+    def _exec(self):
+        return self._world.get("exec")
+
+    def new(self, ticket: Ticket, seq: str, persona: str,
+            opts: Any) -> str:
+        """Create one session dir. A taken name takes a numeric suffix."""
+        fs = self._world.get("fs")
+        base = "%s-%s" % (ticket.id, seq)
+        last = ""
+        for attempt in range(1, 21):
+            name = base if attempt == 1 else "%s-%d" % (base, attempt)
+            got = self._exec().output(
+                ["wisp", "new", "--name", name, "-m", opts.model,
+                 "-t", opts.thinking, "--env-in-system-prompt",
+                 "-s", persona])
+            if got.err.strip():
+                self._world.get("stderr").write(got.err)
+            if got.rc == 0:
+                path = got.out.strip().splitlines()
+                if not path:
+                    fail(self._world, 1, "wisp new printed no session dir")
+                if not fs.isdir(path[-1]):
+                    fail(self._world, 1,
+                         "wisp new printed no session dir: %s" % path[-1])
+                return path[-1]
+            last = "wisp new exited %d for %s" % (got.rc, name)
+            if "already exists" not in got.err:
+                break
+        fail(self._world, 1, last or "wisp new failed")
+
+    def run(self, session: str, turn: str, guard: int | None,
+            to_stdout: bool = True) -> int:
+        """One wisp run. A None guard sends no --context-guard flag."""
+        argv = ["wisp", "run", "-d", session]
+        if guard is not None:
+            argv += ["--context-guard", "%d%%" % guard]
+        got = self._exec().stream(argv, stdin_text=turn,
+                                  to_stdout=to_stdout)
+        return got.rc
+
+    def resume(self, session: str, guard: int,
+               to_stdout: bool = True) -> int:
+        got = self._exec().stream(
+            ["wisp", "continue", "-d", session,
+             "--context-guard", "%d%%" % guard],
+            stdin_text="", to_stdout=to_stdout)
+        return got.rc
+
+    def steer(self, session: str, text: str) -> int:
+        got = self._exec().output(["wisp", "steer", "-d", session],
+                                  stdin_text=text)
+        return got.rc
+
+    def response(self, session: str) -> str:
+        got = self._exec().output(["wisp", "response", "-d", session])
+        return got.out if got.rc == 0 else ""
+
+    def _records(self, session: str) -> list:
+        fs = self._world.get("fs")
+        path = session + "/wisp.jsonl"
+        if not fs.exists(path):
+            return []
+        out = []
+        for line in fs.read_text(path).splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+        return out
+
+    def assistant_count(self, session: str) -> int:
+        return sum(1 for rec in self._records(session)
+                   if rec.get("type") == "assistant")
+
+    def has_work(self, session: str) -> bool:
+        return self.assistant_count(session) > 0
+
+
+# --- prompts -----------------------------------------------------------------
+
+def prompts_dir(world: World) -> str:
+    override = world.get("env").get("WISPY_PROMPTS_DIR")
+    if override:
+        return override
+    return os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                        "prompts")
+
+
+def read_rule(world: World, name: str) -> str:
+    return world.get("fs").read_text(
+        os.path.join(prompts_dir(world), name))
+
+
+def commit_subject(ticket: Ticket) -> str:
+    """The git subject: <status>(<id>): <name>."""
+    return "%s(%s): %s" % (ticket.status or "work", ticket.id,
+                           ticket.name or "<name>")
+
+
+def ticket_pointer(ticket: Ticket) -> str:
+    return '<ticket id="%s" path="%s" file="%s">' % (
+        ticket.id, ticket.dir, ticket.path)
+
+
+def ticket_block(world: World, ticket: Ticket) -> str:
+    text = world.get("fs").read_text(ticket.path)
+    return "\n".join([ticket_pointer(ticket), text.rstrip("\n"),
+                      "</ticket>"])
+
+
+def state_block(world: World, ticket: Ticket) -> str:
+    fs = world.get("fs")
+    path = ticket.dir + "/STATE.md"
+    if not fs.exists(path):
+        return "<state>\nNo state yet.\n</state>"
+    return "\n".join(["<state>", fs.read_text(path).rstrip("\n"),
+                      "</state>"])
+
+
+class PromptService:
+    """Build the persona and the three user turns."""
+
+    def __init__(self, world: World):
+        self._world = world
+
+    def persona(self, ticket: Ticket, seq: str, skills: list,
+                rule: str = "") -> str:
+        world = self._world
+        fs = world.get("fs")
+        base = world.get("exec").output(
+            ["wisp", "build-system-prompt", "--wisp", "--agents-md",
+             "--skills"], stdin_text="")
+        if base.rc != 0:
+            fail(world, 1, "wisp build-system-prompt exited %d" % base.rc)
+        parts = [base.out.rstrip("\n")]
+        if rule:
+            parts.append(read_rule(world, rule).rstrip("\n"))
+        parts.append(ticket_pointer(ticket))
+        for name in skills:
+            body = world.get("exec").output(["wisp", "skill", "read", name])
+            if body.rc != 0 or not body.out.strip():
+                fail(world, 2, "no skill named %s in the skill catalog"
+                               % name)
+            parts.append(body.out.rstrip("\n"))
+        fs.write_text(ticket.dir + "/personas/.gitignore", "*\n")
+        path = "%s/personas/%s.txt" % (ticket.dir, seq)
+        fs.write_text(path, "\n\n".join(p for p in parts if p) + "\n")
+        return path
+
+    def work_turn(self, ticket: Ticket, request: str) -> str:
+        world = self._world
+        parts = [ticket_block(world, ticket), state_block(world, ticket)]
+        if request.strip():
+            parts.append("\n".join(["<request>", request.rstrip(),
+                                    "</request>"]))
+        return "\n".join(parts) + "\n"
+
+    def distill_turn(self, ticket: Ticket, mode: str, cap: int) -> str:
+        world = self._world
+        rules = read_rule(world, "distill-rules.md")
+        rules = rules.replace("@@CAP@@", str(cap)).replace("@@MODE@@", mode)
+        parts = [ticket_block(world, ticket), state_block(world, ticket),
+                 rules.rstrip("\n")]
+        return "\n".join(parts) + "\n"
+
+    def commit_turn(self, ticket: Ticket, steering: str) -> str:
+        world = self._world
+        rules = read_rule(world, "commit-rules.md")
+        head = [
+            "Ticket id: %s" % ticket.id,
+            "Ticket name: %s" % (ticket.name or "(none)"),
+            "Ticket status: %s" % (ticket.status or "(none)"),
+            "",
+            "The commit subject is",
+            "  %s" % commit_subject(ticket),
+        ]
+        parts = [ticket_block(world, ticket), state_block(world, ticket),
+                 "\n".join(head)]
+        if steering.strip():
+            parts.append("\n".join(["<steering>", steering.rstrip(),
+                                    "</steering>"]))
+        parts.append(rules.rstrip("\n"))
+        return "\n".join(parts) + "\n"
+
+
+# --- ticket dir helpers ------------------------------------------------------
+
+def next_seq(world: World, ticket: Ticket) -> str:
+    fs = world.get("fs")
+    path = ticket.dir + "/.seq"
+    number = 0
+    if fs.exists(path):
+        raw = fs.read_text(path).strip()
+        if raw.isdigit():
+            number = int(raw)
+    number += 1
+    fs.write_text(path, "%d\n" % number)
+    return "%03d" % number
+
+
+def next_commit_seq(world: World, ticket: Ticket) -> str:
+    fs = world.get("fs")
+    path = ticket.dir + "/sessions.txt"
+    count = 0
+    if fs.exists(path):
+        for line in fs.read_text(path).splitlines():
+            if re.search(r"-c[0-9]+$", line.strip()):
+                count += 1
+    return "%02d" % (count + 1)
+
+
+def record_session(world: World, ticket: Ticket, session: str) -> None:
+    world.get("fs").append_text(ticket.dir + "/sessions.txt", session + "\n")
+
+
+def write_skills(world: World, ticket: Ticket, seq: str,
+                 skills: list) -> None:
+    world.get("fs").write_text("%s/skills/%s.txt" % (ticket.dir, seq),
+                               ",".join(skills) + "\n")
+
+
+def read_skills(world: World, ticket: Ticket, seq: str) -> list:
+    fs = world.get("fs")
+    path = "%s/skills/%s.txt" % (ticket.dir, seq)
+    if not fs.exists(path):
+        return []
+    return [name for name in split_skills(fs.read_text(path))]
+
+
+def split_skills(raw: str) -> list:
+    out = []
+    for item in raw.split(","):
+        name = item.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+def save_response(world: World, ticket: Ticket, session: str,
+                  seq: str) -> None:
+    """Save the work answer. It is record, so it travels with the ticket.
+
+    The commit turn writes no response. Every response is final before the
+    commit turn, which reads the responses as the derived record.
+    """
+    fs = world.get("fs")
+    text = world.get("session").response(session)
+    drop_response_ignore(world, ticket)
+    path = "%s/responses/%s.md" % (ticket.dir, seq)
+    if text.strip():
+        fs.write_text(path, text if text.endswith("\n") else text + "\n")
+        note(world, "response %s saved: %s" % (seq, path))
+    else:
+        fs.remove(path)
+
+
+def strip_fences(text: str) -> str:
+    """Drop one code fence around the whole text, when the model adds one."""
+    body = text.strip("\n")
+    lines = body.splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") \
+            and lines[-1].startswith("```"):
+        body = "\n".join(lines[1:-1])
+    return body.rstrip("\n") + "\n"
+
+
+def state_sections(text: str) -> dict:
+    """Split a state file by its top-level headings."""
+    out: dict = {}
+    current = None
+    for line in text.splitlines():
+        if line.startswith("# "):
+            current = line[2:].strip().lower()
+            out.setdefault(current, [])
+        elif current is not None and line.strip():
+            out[current].append(line.rstrip())
+    return out
+
+
+def check_state(world: World, ticket: Ticket, text: str, cap: int) -> None:
+    """Note a state problem. Never rewrite the state."""
+    sections = state_sections(text)
+    filled = [line for line in text.splitlines() if line.strip()]
+    if len(filled) > cap:
+        note(world, "STATE.md is %d non-empty lines; the cap is %d"
+                    % (len(filled), cap))
+    for name in ("next", "open", "cache", "pointers"):
+        if name not in sections:
+            note(world, "STATE.md has no %s section" % name)
+    opens = sections.get("open", [])
+    cache = sections.get("cache", [])
+    tasks = len(re.findall(r"^- \[[ xX]\]", ticket.text, re.M))
+    for line in cache:
+        match = re.search(r"\(Serves:\s*([^)]*)\)", line)
+        if not match:
+            note(world, "Cache line has no (Serves: ...) key: %.60s" % line)
+            continue
+        value = match.group(1).strip()
+        low = value.lower()
+        if low in ("next", "open"):
+            if not sections.get(low, []):
+                note(world, "Cache line serves %s, but %s is empty;"
+                            " cut the line" % (value, value))
+        elif low == "cold":
+            continue
+        else:
+            task = re.fullmatch(r"task ([0-9]+)", value, re.I)
+            if not task:
+                note(world, "Cache line has a bad Serves value: %s" % value)
+            elif int(task.group(1)) > tasks:
+                note(world, "Cache line serves task %s, but the ticket has"
+                            " %d tasks; cut the line"
+                            % (task.group(1), tasks))
+    if opens:
+        note(world, "STATE.md holds %d open question(s); the next session"
+                    " sees them" % len(opens))
+
+
+def distill(world: World, ticket: Ticket, session: str, seq: str,
+            mode: str, opts: Any) -> int:
+    """One distill turn in the work session. The reply is STATE.md.
+
+    The turn runs with no context guard. A work session that the guard
+    stopped sits at the limit already, and its distill prompt is larger.
+    A guarded distill call stops at its first tool round, and the loop
+    dies. The next session starts fresh.
+    """
+    sessions = world.get("session")
+    fs = world.get("fs")
+    note(world, "distill %s in %s; distill stream silenced" % (seq, session))
+    before = sessions.assistant_count(session)
+    turn = world.get("prompt").distill_turn(ticket, mode, opts.cap)
+    # No guard: the work session that hit the guard sits at the limit
+    # already, and the distill prompt is larger. A guarded distill call
+    # stops at its first tool round, and the loop dies.
+    rc = sessions.run(session, turn, None, to_stdout=False)
+    if rc != 0:
+        note(world, "distill exited %d; the ticket may be partial" % rc)
+        note(world, "repair: wispy continue retries the distill")
+        return rc
+    if sessions.assistant_count(session) <= before:
+        note(world, "distill gave no output; the marker stays")
+        return 1
+    text = strip_fences(sessions.response(session))
+    if not text.strip():
+        note(world, "distill gave no output; the marker stays")
+        return 1
+    fs.write_text(ticket.dir + "/STATE.md", text)
+    fs.write_text("%s/states/%s.md" % (ticket.dir, seq), text)
+    record_session(world, ticket, session)
+    fresh = Ticket(id=ticket.id, name=ticket.name, status=ticket.status,
+                   path=ticket.path, dir=ticket.dir,
+                   text=fs.read_text(ticket.path))
+    check_state(world, fresh, text, opts.cap)
+    clear_phase(world, ticket)
+    return 0
+
+
+# --- commands ----------------------------------------------------------------
+
+def read_stdin_text(world: World) -> str:
+    stdin = world.get("stdin")
+    if stdin.is_interactive():
+        return ""
+    return stdin.read_text()
+
+
+def read_steering(world: World) -> str:
+    text = read_stdin_text(world)
+    if len(text) > STEER_MAX:
+        fail(world, 2, "the brief is over %d bytes; give a short one"
+                       % STEER_MAX)
+    return text if text.strip() else ""
+
+
+def sigint_stop(world: World, ticket: Ticket, session: str, seq: str) -> int:
+    save_response(world, ticket, session, seq)
+    note(world, "Ctrl-c: stopping; no distill; work session %s stays open"
+                % seq)
+    note(world, "repair: wispy continue resumes session %s" % session)
+    return 130
+
+
+def start_session(world: World, opts: Any, ticket: Ticket,
+                  skills: list) -> tuple:
+    mark_wip(world, ticket)
+    seq = next_seq(world, ticket)
+    persona = world.get("prompt").persona(ticket, seq, skills,
+                                          "run-rules.md")
+    session = world.get("session").new(ticket, seq, persona, opts)
+    write_skills(world, ticket, seq, skills)
+    write_phase(world, ticket, Phase("work", seq, session))
+    note(world, "work session %s-%s: %s" % (ticket.id, seq, session))
+    return seq, session
+
+
+def start_next(world: World, opts: Any, ticket: Ticket, skills: list,
+               used: int) -> int:
+    """Start one more session of the loop, under the session cap."""
+    used += 1
+    if used > opts.max_sessions:
+        note(world, "session cap %d reached; the work is not done"
+                    % opts.max_sessions)
+        return 75
+    seq, session = start_session(world, opts, ticket, skills)
+    return drive(world, opts, ticket, session, seq, "", skills, "run", used)
+
+
+def drive(world: World, opts: Any, ticket: Ticket, session: str, seq: str,
+          request: str, skills: list, mode: str, used: int) -> int:
+    """The work loop of one session and its successors."""
+    sessions = world.get("session")
+    signals = world.get("signal")
+    first = True
+    while True:
+        if signals.interrupted():
+            note(world, "Ctrl-c: stopping before the next session")
+            return 130
+        if first and mode == "continue":
+            rc = sessions.resume(session, opts.guard)
+            if rc == 1:
+                note(world, "wisp continue exits 1 when the segment is"
+                            " already finished; then pass a request:")
+                note(world, "repair: wispy continue with a request on stdin")
+        elif first:
+            rc = sessions.run(session, world.get("prompt").work_turn(
+                ticket, request), opts.guard)
+        else:
+            rc = sessions.run(session, world.get("prompt").work_turn(
+                ticket, ""), opts.guard)
+        first = False
+        request = ""
+        action, value = decide_after_work(
+            rc, signals.interrupted(), sessions.has_work(session))
+        if action == "sigint":
+            return sigint_stop(world, ticket, session, seq)
+        if action == "api":
+            note(world, "API error in the work run")
+            note(world, "repair: wispy continue resumes session %s" % session)
+            return 1
+        if action == "abandon":
+            record_session(world, ticket, session)
+            clear_phase(world, ticket)
+            note(world, "work run exited %d with no finished round;"
+                        " the state is not written" % rc)
+            return rc
+        save_response(world, ticket, session, seq)
+        after = "STOP" if action == "stop" else "LOOP"
+        write_phase(world, ticket, Phase("distill", seq, session, after))
+        rc = distill(world, ticket, session, seq, after, opts)
+        if rc != 0:
+            return rc
+        if after == "STOP":
+            if value:
+                note(world, "work run was killed; the state is written;"
+                            " stopping")
+            return value
+        rc = start_next(world, opts, ticket, skills, used)
+        return rc
+
+
+def resume(world: World, opts: Any, ticket: Ticket, phase: Phase,
+           request: str, via: str) -> int:
+    """Finish the open phase named by .phase."""
+    if opts.skills:
+        fail(world, 2, "--skills starts no session here; start a new run")
+    if phase.kind == "work":
+        skills = read_skills(world, ticket, phase.seq)
+        mark_wip(world, ticket)
+        note(world, "resuming work session %s (seq %s)"
+                    % (phase.session, phase.seq))
+        mode = "run" if request.strip() else "continue"
+        return drive(world, opts, ticket, phase.session, phase.seq, request,
+                     skills, mode, 0)
+    if phase.kind == "distill":
+        if request.strip():
+            note(world, "the request on stdin is not used;"
+                        " the distill runs first")
+        skills = read_skills(world, ticket, phase.seq)
+        note(world, "resuming the distill of session %s" % phase.session)
+        mode = phase.after or "STOP"
+        rc = distill(world, ticket, phase.session, phase.seq, mode, opts)
+        if rc != 0:
+            return rc
+        if mode != "LOOP":
+            return 0
+        return start_next(world, opts, ticket, skills, 0)
+    fail(world, 2, "the phase marker names a commit; run wispy commit")
+
+
+def cmd_run(world: World, opts: Any) -> int:
+    ticket = world.get("ticket").open()
+    phase = read_phase(world, ticket)
+    request = read_stdin_text(world)
+    if phase is not None:
+        if phase.kind == "commit":
+            fail(world, 2, "ticket %s has an unfinished commit;"
+                           " run wispy commit" % ticket.id)
+        return resume(world, opts, ticket, phase, request, "run")
+    skills = split_skills(",".join(opts.skills))
+    world.get("fs").mkdir(ticket.dir + "/states")
+    world.get("fs").append_text(ticket.dir + "/sessions.txt", "")
+    seq, session = start_session(world, opts, ticket, skills)
+    return drive(world, opts, ticket, session, seq, request, skills, "run", 1)
+
+
+def cmd_continue(world: World, opts: Any) -> int:
+    ticket = world.get("ticket").open()
+    phase = read_phase(world, ticket)
+    if phase is None:
+        fail(world, 2, "ticket %s has no open session; use wispy run"
+                       % ticket.id)
+    if phase.kind == "commit":
+        fail(world, 2, "ticket %s has an unfinished commit;"
+                       " run wispy commit" % ticket.id)
+    return resume(world, opts, ticket, phase, read_stdin_text(world),
+                  "continue")
+
+
+def cmd_steer(world: World, opts: Any) -> int:
+    ticket = world.get("ticket").open()
+    phase = read_phase(world, ticket)
+    if phase is None:
+        fail(world, 2, "ticket %s has no open session to steer" % ticket.id)
+    if phase.kind == "commit":
+        fail(world, 2, "ticket %s has an unfinished commit; a steer would"
+                       " land in a later session" % ticket.id)
+    text = world.get("stdin").read_text()
+    if not text.strip():
+        fail(world, 2, "no steer message on stdin")
+    rc = world.get("session").steer(phase.session, text)
+    if rc != 0:
+        fail(world, rc, "wisp steer exited %d" % rc)
+    note(world, "steer queued for session %s" % phase.session)
+    return 0
+
+
+def git_output(world: World, argv: list, cwd: str) -> Result:
+    return world.get("exec").output(argv, stdin_text="", cwd=cwd)
+
+
+def git_root(world: World) -> str:
+    got = git_output(world, ["git", "rev-parse", "--show-toplevel"],
+                     world.get("fs").cwd())
+    return got.out.strip() if got.rc == 0 else ""
+
+
+WRAPPER_STATE = (".phase", ".seq", "skills/", "personas/")
+TICKET_IGNORE = ".gitignore"
+TICKET_IGNORE_HEADER = "# wispy: wrapper state, not ticket record"
+LEGACY_WRAPPER_IGNORE = ("responses/",)
+
+
+def drop_response_ignore(world: World, ticket: Ticket) -> None:
+    """Remove the legacy `responses/.gitignore`; the responses are record."""
+    world.get("fs").remove(ticket.dir + "/responses/" + TICKET_IGNORE)
+
+
+def ensure_ticket_gitignore(world: World, ticket: Ticket) -> None:
+    """Write the wrapper-state list into the ticket dir .gitignore."""
+    fs = world.get("fs")
+    drop_response_ignore(world, ticket)
+    path = ticket.dir + "/" + TICKET_IGNORE
+    lines = []
+    if fs.exists(path):
+        lines = fs.read_text(path).splitlines()
+    kept = [line for line in lines
+            if line.strip() not in LEGACY_WRAPPER_IGNORE]
+    have = set(line.strip() for line in kept)
+    missing = [item for item in WRAPPER_STATE if item not in have]
+    if not missing and kept == lines:
+        return
+    if not kept:
+        kept = [TICKET_IGNORE_HEADER]
+    fs.write_text(path, "\n".join(kept + missing) + "\n")
+
+
+def ticket_relative(repo: str, ticket: Ticket) -> str:
+    """The ticket dir path relative to the work tree root."""
+    root = repo.rstrip("/")
+    if ticket.dir.startswith(root + "/"):
+        return ticket.dir[len(root) + 1:]
+    return ""
+
+
+def is_wrapper_state(rest: str) -> bool:
+    """True when a ticket-dir path belongs to the wrapper state."""
+    if rest in (".phase", ".seq"):
+        return True
+    return any(rest.startswith(item)
+               for item in ("skills/", "personas/"))
+
+
+def record_lines(status_text: str, repo: str, ticket: Ticket,
+                 ignore_gitignore: bool) -> list:
+    """The status lines that name ticket record, not wrapper state."""
+    rel = ticket_relative(repo, ticket)
+    root = repo.rstrip("/") + "/"
+    out = []
+    for line in status_text.splitlines():
+        if not line.strip():
+            continue
+        rest = line[3:].strip()
+        if " -> " in rest:
+            rest = rest.split(" -> ", 1)[1].strip()
+        rest = rest.strip('"')
+        if rest.startswith(root):
+            rest = rest[len(root):]
+        if rel and rest.startswith(rel + "/"):
+            inner = rest[len(rel) + 1:]
+            if is_wrapper_state(inner):
+                continue
+            if ignore_gitignore and inner == TICKET_IGNORE:
+                continue
+        out.append(line)
+    return out
+
+
+def cmd_commit(world: World, opts: Any) -> int:
+    ticket = world.get("ticket").open()
+    phase = read_phase(world, ticket)
+    if phase is not None and phase.kind != "commit":
+        fail(world, 2, "ticket %s has an unfinished run: %s"
+                       % (ticket.id, phase_text(phase)))
+    repo = git_root(world)
+    if not repo:
+        fail(world, 1, "commit needs a git work tree")
+    if not (ticket.dir + "/").startswith(repo + "/"):
+        fail(world, 1, "ticket dir %s is outside the git work tree %s"
+                       % (ticket.dir, repo))
+    steering = read_steering(world)
+    if phase is not None:
+        clear_phase(world, ticket)
+    ensure_ticket_gitignore(world, ticket)
+    status = git_output(world, ["git", "status", "--porcelain"], repo)
+    if status.rc != 0:
+        fail(world, 1, "git status exited %d" % status.rc)
+    if not record_lines(status.out, repo, ticket, ignore_gitignore=True):
+        if steering:
+            note(world, "work tree clean; nothing to commit;"
+                        " the brief was not used")
+        else:
+            note(world, "work tree clean; nothing to commit")
+        return 0
+    before = git_output(world, ["git", "rev-parse", "HEAD"], repo).out.strip()
+    skills = split_skills(",".join(opts.skills))
+    cseq = next_commit_seq(world, ticket)
+    seq = "c%s" % cseq
+    persona = world.get("prompt").persona(ticket, seq, skills)
+    session = world.get("session").new(ticket, seq, persona, opts)
+    write_skills(world, ticket, seq, skills)
+    write_phase(world, ticket, Phase("commit", seq, session))
+    record_session(world, ticket, session)
+    note(world, "commit session %s-%s: %s" % (ticket.id, seq, session))
+    note(world, "commit run; its stream is on stdout")
+    if steering:
+        note(world, "the brief is in the commit prompt; %s/wisp.jsonl"
+                    " records it" % session)
+    rc = world.get("session").run(
+        session, world.get("prompt").commit_turn(ticket, steering),
+        opts.guard)
+    if rc != 0:
+        note(world, "commit session exited %d" % rc)
+        note(world, "repair: wispy commit retries in a fresh session")
+        return rc
+    after = git_output(world, ["git", "rev-parse", "HEAD"], repo).out.strip()
+    if before == after:
+        note(world, "the commit session made no commit; the tree is dirty")
+        note(world, "repair: wispy commit retries in a fresh session")
+        return 1
+    left = git_output(world, ["git", "status", "--porcelain", "--",
+                              ticket.dir], repo)
+    dirty = record_lines(left.out, repo, ticket, ignore_gitignore=False)
+    if dirty:
+        note(world, "the ticket dir holds uncommitted record:")
+        world.get("stderr").write("\n".join(dirty) + "\n")
+        note(world, "repair: wispy commit retries in a fresh session")
+        return 1
+    clear_phase(world, ticket)
+    shown = git_output(world, ["git", "show", "--stat", "HEAD"], repo)
+    world.get("stderr").write(shown.out)
+    return 0
+
+
+def cmd_response(world: World, opts: Any) -> int:
+    ticket = world.get("ticket").open()
+    fs = world.get("fs")
+    path = ticket.dir + "/responses"
+    if not fs.isdir(path):
+        fail(world, 2, "ticket %s has no saved work response yet" % ticket.id)
+    names = [name for name in fs.listdir(path)
+             if re.fullmatch(r"[0-9]+\.md", name)]
+    if not names:
+        fail(world, 2, "ticket %s has no saved work response yet" % ticket.id)
+    newest = max(names, key=lambda name: int(name[:-3]))
+    text = fs.read_text(path + "/" + newest)
+    world.get("stdout").write(text if text.endswith("\n") else text + "\n")
+    return 0
+
+
+# --- cli ---------------------------------------------------------------------
+
+@dataclass
+class Opts:
+    command: str = ""
+    model: str = MODEL
+    thinking: str = THINKING
+    guard: int = GUARD
+    cap: int = CAP
+    max_sessions: int = MAX_SESSIONS
+    skills: list = field(default_factory=list)
+
+
+COMMANDS: dict = {
+    "run": cmd_run,
+    "continue": cmd_continue,
+    "steer": cmd_steer,
+    "commit": cmd_commit,
+    "response": cmd_response,
+}
+
+VALUED: dict = {
+    "--model": "model",
+    "-t": "thinking",
+    "--thinking": "thinking",
+    "--guard": "guard",
+    "--cap": "cap",
+    "--max-sessions": "max_sessions",
+    "--skills": "skills",
+}
+
+NUMBERS = ("guard", "cap", "max_sessions")
+
+
+def parse_args(world: World, argv: list) -> Opts | None:
+    if not argv:
+        return None
+    if argv[0] in ("-h", "--help", "help"):
+        return None
+    opts = Opts(command=argv[0])
+    if opts.command not in COMMANDS:
+        fail(world, 2, "unknown command: %s" % opts.command)
+    rest = argv[1:]
+    while rest:
+        arg = rest.pop(0)
+        if arg in VALUED:
+            if not rest:
+                fail(world, 2, "%s needs a value" % arg)
+            value = rest.pop(0)
+            name = VALUED[arg]
+            if name in NUMBERS:
+                value = value.rstrip("%")
+                if not value.isdigit() or int(value) < 1:
+                    fail(world, 2, "%s needs a number of 1 or more" % arg)
+                setattr(opts, name, int(value))
+            elif name == "skills":
+                opts.skills.extend(split_skills(value))
+            else:
+                setattr(opts, name, value)
+            continue
+        if arg.startswith("--") and "=" in arg:
+            flag, value = arg.split("=", 1)
+            if flag in VALUED:
+                rest.insert(0, value)
+                rest.insert(0, flag)
+                continue
+        if arg.startswith("-"):
+            fail(world, 2, "unknown flag: %s" % arg)
+        fail(world, 2, "wispy takes no positional argument;"
+                       " set WISPY_TICKET")
+    if opts.guard < 1 or opts.guard > 100:
+        fail(world, 2, "--guard needs a percent from 1 to 100")
+    if opts.skills and opts.command not in ("run", "commit"):
+        fail(world, 2, "%s takes no --skills; start a run to set the skill set"
+                       % opts.command)
+    return opts
+
+
+def main(argv: list | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    world = World(IMPLS)
+    world.get("signal").install()
+    rc = 1
+    try:
+        opts = parse_args(world, argv)
+        if opts is None:
+            world.get("stdout").write(__doc__ or "")
+            return 0
+        rc = COMMANDS[opts.command](world, opts)
+    except CmdError as exc:
+        if exc.message:
+            world.get("stderr").write("%s: %s\n" % (PROG, exc.message))
+        rc = exc.code
+    except BrokenPipeError:
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY),
+                    sys.stdout.fileno())
+        except (AttributeError, OSError, ValueError):
+            pass
+        rc = 141
+    except KeyboardInterrupt:
+        world.get("stderr").write("%s: signal 2; exit 130\n" % PROG)
+        rc = 130
+    return rc
+
+
+IMPLS: dict[str, Callable[[World], Any]] = {
+    "stdout": lambda w: Stdio(sys.stdout),
+    "stderr": lambda w: Stdio(sys.stderr),
+    "stdin": lambda w: StdinFile(sys.stdin),
+    "env": lambda w: dict(os.environ),
+    "fs": lambda w: Fs(),
+    "exec": Exec,
+    "signal": Signals,
+    "ticket": TicketService,
+    "session": SessionService,
+    "prompt": PromptService,
+}
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
