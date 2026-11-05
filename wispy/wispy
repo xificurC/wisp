@@ -30,7 +30,8 @@ text becomes the <request> of that turn. No marker exits 2.
 
 steer sends the whole stdin text to the session named by .phase. No
 marker exits 2, and an unfinished commit exits 2. It sends no message
-to a later session.
+to a later session. A terminal stdin exits 2 with a hint; the message
+must arrive through a pipe.
 
 commit runs one seal session. It reads an optional one-shot brief on
 stdin, stages the ticket's work, and makes one commit. It runs no
@@ -968,7 +969,11 @@ def cmd_steer(world: World, opts: Any) -> int:
     if phase.kind == "commit":
         fail(world, 2, "ticket %s has an unfinished commit; a steer would"
                        " land in a later session" % ticket.id)
-    text = world.get("stdin").read_text()
+    stdin = world.get("stdin")
+    if stdin.is_interactive():
+        fail(world, 2, "stdin is a terminal; pipe the steer message in,"
+                       " e.g. wispy steer <<< 'message'")
+    text = stdin.read_text()
     if not text.strip():
         fail(world, 2, "no steer message on stdin")
     rc = world.get("session").steer(phase.session, text)

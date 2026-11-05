@@ -737,6 +737,13 @@ class SteerTests(unittest.TestCase):
         harness.fs.write_text(TD + "/.phase", "commit c01 %s\n" % session)
         self.assertEqual(harness.run("steer"), 2)
 
+    def test_a_terminal_stdin_exits_two_with_a_hint(self):
+        harness = Harness(stdin="", interactive=True)
+        session = harness.add_session("001")
+        harness.fs.write_text(TD + "/.phase", "work 001 %s\n" % session)
+        self.assertEqual(harness.run("steer"), 2)
+        self.assertIn("pipe the steer message in", harness.errors())
+
 
 class SkillsTests(unittest.TestCase):
     def test_skills_reach_the_persona(self):
