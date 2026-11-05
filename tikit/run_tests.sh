@@ -86,7 +86,7 @@ D=$(mktemp -d); cd / || exit 1
 P=$(TIKIT_DIR="$D" "$SCRIPT" create --name t); RC=$?
 ID=$(basename "$(dirname "$P")")
 check "id_slug_empty_basename_root_rc" "[ $RC -eq 0 ]"
-check "id_slug_empty_basename_root_id" "printf '%s' \"$ID\" | grep -qE '^-[a-z0-9]{6}\$'"
+check "id_slug_empty_basename_root_id" "printf '%s' \"$ID\" | grep -qE '^t-[a-z0-9]{6}\$'"
 
 echo "=== create layout / output ==="
 D=$(mktemp -d); mkdir -p "$D/tikit"; cd "$D/tikit" || exit 1
@@ -119,6 +119,48 @@ D=$(mktemp -d); mkdir -p "$D/tikit"; cd "$D/tikit" || exit 1
 "$SCRIPT" create extra >/dev/null 2>&1; check "create_unexpected_positional_error" "[ $? -ne 0 ]"
 "$SCRIPT" create --help >/dev/null 2>&1; check "create_help_exit0" "[ $? -eq 0 ]"
 "$SCRIPT" create -h >/dev/null 2>&1; check "create_h_short_exit0" "[ $? -eq 0 ]"
+
+echo "=== id gate / overwrite gate ==="
+D=$(mktemp -d); mkdir -p "$D/tikit"; cd "$D/tikit" || exit 1
+"$SCRIPT" create --id taken >/dev/null
+printf -- "---\nid: 'taken'\nname: 'orig'\nstatus: 'open'\ncreated: '2020-01-01T00:00:00Z'\nparent: null\nblocked-on: []\n---\nbody line\n" > "$D/tikit/.tickets/taken/ticket.md"
+"$SCRIPT" create --id taken >/dev/null 2>/tmp/tikit.err; RC=$?
+check "create_existing_id_refused_rc" "[ $RC -ne 0 ]"
+check "create_existing_id_refused_msg" "grep -q 'already exists' /tmp/tikit.err"
+check "create_existing_id_keeps_file" "grep -q \"name: 'orig'\" \"$D/tikit/.tickets/taken/ticket.md\""
+"$SCRIPT" create --id taken --force --name new >/dev/null 2>&1; RC=$?
+check "create_force_overwrites_rc" "[ $RC -eq 0 ]"
+check "create_force_overwrites_file" "grep -q \"name: 'new'\" \"$D/tikit/.tickets/taken/ticket.md\""
+"$SCRIPT" create --id ../escape >/dev/null 2>/tmp/tikit.err; RC=$?
+check "create_id_traversal_refused_rc" "[ $RC -ne 0 ]"
+check "create_id_traversal_refused_msg" "grep -q 'bad id' /tmp/tikit.err"
+check "create_id_traversal_no_escape" "[ ! -e '$D/escape' ]"
+"$SCRIPT" create --id /tmp/tikit-escape-abs >/dev/null 2>&1; RC=$?
+check "create_id_absolute_refused_rc" "[ $RC -ne 0 ]"
+check "create_id_absolute_refused_no_file" "[ ! -e /tmp/tikit-escape-abs ]"
+"$SCRIPT" create --id "a b" >/dev/null 2>&1
+check "create_id_space_refused_rc" "[ $? -ne 0 ]"
+"$SCRIPT" create --id .. >/dev/null 2>&1
+check "create_id_dotdot_refused_rc" "[ $? -ne 0 ]"
+
+echo "=== null representation ==="
+D=$(mktemp -d); mkdir -p "$D/tikit"; cd "$D/tikit" || exit 1
+"$SCRIPT" create --name n1 >/dev/null
+J=$("$SCRIPT" query --json)
+echo "$J" | python3 -c "
+import json,sys
+o=json.loads(sys.stdin.readline())
+assert o['parent'] is None, o['parent']
+assert o['blocked-on']==[], o['blocked-on']
+print('null-ok')
+" >/tmp/t_null
+check "json_parent_is_null" "grep -q null-ok /tmp/t_null"
+N=$("$SCRIPT" query --files --parent null | wc -l | tr -d ' ')
+check "filter_null_positive_empty" "[ $N -eq 0 ]"
+N=$("$SCRIPT" query --files not --parent . | wc -l | tr -d ' ')
+check "filter_null_negated_matches" "[ $N -eq 1 ]"
+S=$("$SCRIPT" query --sql 'SELECT id FROM tickets WHERE parent IS NULL' | wc -l | tr -d ' ')
+check "sql_parent_is_null" "[ $S -eq 1 ]"
 
 echo "=== create permissive / id override ==="
 D=$(mktemp -d); mkdir -p "$D/tikit"; cd "$D/tikit" || exit 1

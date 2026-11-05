@@ -39,9 +39,12 @@ resolve_ticket_dir() {
 
 # ---- id generation -----------------------------------------------------------
 gen_slug() {
-    # First 4 chars of cwd basename, case-preserving (NOT lowercased).
+    # First 4 chars of cwd basename, case-preserving (NOT lowercased),
+    # alnum only so the id stays one safe path component; "t" when
+    # nothing remains (e.g. "/" or a basename of pure punctuation).
     local base="${PWD##*/}"
-    printf '%s' "${base:0:4}"
+    base=$(printf '%s' "$base" | tr -cd 'A-Za-z0-9' | head -c 4)
+    printf '%s' "${base:-t}"
 }
 
 gen_code() {
@@ -102,9 +105,13 @@ Create a new ticket under <ticketdir>/<id>/ticket.md.
 
   --key value   Set a frontmatter key to value. Values may be scalars or, when
                 wrapped in colons with length>2 (e.g. :a:b:), lists.
-  --id <id>     Override the auto-generated id.
+  --id <id>     Override the auto-generated id. One path-safe component:
+                1-128 chars of letters, digits, '.', '-', '_'; it must start
+                with a letter or digit.
   --name <name> Set the ticket name (default: empty).
   --status <s>  Set the status (default: open).
+  --force       Overwrite the ticket when <id> already exists. Without it,
+                an existing ticket.md is refused, never replaced.
   -h, --help    Show this help.
 
 The created ticket's absolute path is printed.
@@ -122,6 +129,7 @@ cmd_create() {
     local name_override=""
     local status_override=""
     local created_override=""
+    local force=0
     local extra_args=()
 
     while [ $# -gt 0 ]; do
@@ -129,6 +137,10 @@ cmd_create() {
             -h|--help)
                 print_create_help
                 exit 0
+                ;;
+            --force)
+                force=1
+                shift
                 ;;
             --)
                 shift
@@ -195,8 +207,10 @@ cmd_create() {
     spec_args+=("${extra_args[@]}")
 
     # Delegate file creation + YAML emission to python.
-    python3 - "$ticketdir" "$id" "${spec_args[@]}" <<'PYEOF'
+    PY_FORCE="$force" python3 - "$ticketdir" "$id" "${spec_args[@]}" <<'PYEOF'
 import os, re, sys
+
+ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
 
 def is_list(v):
     return len(v) > 2 and v.startswith(':') and v.endswith(':')
@@ -229,6 +243,11 @@ def emit_value(v):
 def main():
     ticketdir = sys.argv[1]
     tid = sys.argv[2]
+    if not ID_RE.fullmatch(tid):
+        sys.stderr.write("error: bad id '%s': use 1-128 chars of letters,"
+                         " digits, '.', '-', '_', starting with a letter or"
+                         " a digit\n" % tid)
+        sys.exit(1)
     # Read specs as alternating key/value pairs from argv[3:].
     specs_dict = {}
     pairs = sys.argv[3:]
@@ -266,6 +285,10 @@ def main():
         sys.stderr.write('error: cannot create ticket directory %s: %s\n' % (folder, e))
         sys.exit(1)
     path = os.path.join(folder, 'ticket.md')
+    if os.path.exists(path) and os.environ.get('PY_FORCE') != '1':
+        sys.stderr.write('error: ticket already exists: %s;'
+                         ' pass --force to overwrite\n' % path)
+        sys.exit(1)
     try:
         with open(path, 'w') as f:
             f.write(content)
@@ -296,6 +319,7 @@ filters (files/json only; not allowed with --sql):
   not                  Negate the next --key filter.
   Filters are AND-composed. List values are matched as :v1:v2:.
   A missing key fails a positive filter and passes a negated one.
+  A null value (unquoted null or ~) counts as a missing key.
 
 examples:
   tikit query --files --status open
@@ -535,6 +559,10 @@ def parse_flow(s):
         return []
     return [parse_scalar(e) for e in split_flow(inner)]
 
+NULL_TOKENS = {'null', 'Null', 'NULL', '~'}
+"""Unquoted scalars YAML reads as null. A quoted 'null' stays a string."""
+
+
 def parse_frontmatter(lines):
     result = {}
     order = []
@@ -564,7 +592,10 @@ def parse_frontmatter(lines):
                 if key not in order:
                     order.append(key)
             else:
-                result[key] = parse_scalar(rs)
+                if rs in NULL_TOKENS:
+                    result[key] = None
+                else:
+                    result[key] = parse_scalar(rs)
                 if key not in order:
                     order.append(key)
     return result, order
@@ -644,7 +675,7 @@ def fm_to_json_obj(fm, order):
         if isinstance(v, list):
             obj[k] = [str(x) for x in v]
         elif v is None:
-            obj[k] = ''
+            obj[k] = None
         else:
             obj[k] = str(v)
     # Include any keys present in fm but missing from order (safety).
@@ -654,7 +685,7 @@ def fm_to_json_obj(fm, order):
             if isinstance(v, list):
                 obj[k] = [str(x) for x in v]
             elif v is None:
-                obj[k] = ''
+                obj[k] = None
             else:
                 obj[k] = str(v)
     return obj
