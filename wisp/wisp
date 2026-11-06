@@ -60,7 +60,8 @@ agents-md and build-system-prompt take no -d; they scan the CWD walk
 and the user-level places.
 
 Env: WISP_SESSION_DIR, WISP_SESSIONS_ROOT, WISP_LLM_URL, WISP_LLM_API_KEY,
-WISP_LLM_MAX_TURNS.
+WISP_LLM_MAX_TURNS, WISP_LLM_STREAM. WISP_LLM_STREAM=false sends one
+non-stream chat request per turn and prints the whole turn as one chunk.
 """
 
 from __future__ import annotations
@@ -1918,7 +1919,9 @@ def command_help_text(cmd: str) -> str:
             "all work on it. Percent mode fails at start when",
             "wisp.modelcfg holds no context window for the model.",
             "Env: WISP_SESSION_DIR, WISP_LLM_URL, WISP_LLM_API_KEY,",
-            "WISP_LLM_MAX_TURNS.",
+            "WISP_LLM_MAX_TURNS, WISP_LLM_STREAM.",
+            "WISP_LLM_STREAM=false sends one non-stream chat request",
+            "and prints the turn as one chunk.",
         ]) + "\n",
         "continue": "\n".join([
             "wisp continue: finish an open segment without a new prompt.",
@@ -1937,7 +1940,9 @@ def command_help_text(cmd: str) -> str:
             "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp",
             "continue fails. The session dir must hold wisp.jsonl.",
             "Env: WISP_SESSION_DIR, WISP_LLM_URL, WISP_LLM_API_KEY,",
-            "WISP_LLM_MAX_TURNS.",
+            "WISP_LLM_MAX_TURNS, WISP_LLM_STREAM.",
+            "WISP_LLM_STREAM=false sends one non-stream chat request",
+            "and prints the turn as one chunk.",
         ]) + "\n",
         "steer": "\n".join([
             "wisp steer: queue one steering message for the session's runs.",
@@ -2304,6 +2309,37 @@ class Http:
         with response:
             for raw in response:
                 yield raw.decode("utf-8", "replace").rstrip("\r\n")
+
+    def post_json(self, url: str, headers: dict, body: dict,
+                  meta: dict | None = None) -> Any:
+        """POST one request and return its whole JSON body.
+
+        The request, the error wrapping and the meta fill match
+        post_stream. One read and one parse; a body that does not
+        parse raises HttpError("not a JSON response: ..."). post_stream
+        splits lines, so a pretty-printed body would break it."""
+        request = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"),
+            headers=dict(headers), method="POST")
+        try:
+            response = urllib.request.urlopen(request, timeout=HTTP_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            if meta is not None:
+                meta["status"] = exc.code
+                meta["request_id"] = request_id_of_headers(exc.headers)
+            snippet = exc.read(4096).decode("utf-8", "replace").strip()
+            raise HttpError("%s %s" % (exc.code, snippet or exc.reason)) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise HttpError(str(exc)) from exc
+        if meta is not None:
+            meta["status"] = getattr(response, "status", None)
+            meta["request_id"] = request_id_of_headers(
+                getattr(response, "headers", None))
+        with response:
+            try:
+                return json.loads(response.read().decode("utf-8", "replace"))
+            except ValueError as exc:
+                raise HttpError("not a JSON response: %s" % exc) from exc
 
     def get_json(self, url: str, headers: dict) -> Any:
         request = urllib.request.Request(url, headers=dict(headers), method="GET")
@@ -2880,6 +2916,30 @@ def provider_of(world: World) -> str:
     return api
 
 
+STREAM_OFF_WORDS = ("false", "0", "no", "off")
+"""WISP_LLM_STREAM values that turn one turn into one non-stream call."""
+
+
+def stream_enabled_of(world: World) -> bool:
+    """Whether this run asks the endpoint for one streamed response.
+
+    WISP_LLM_STREAM unset or empty keeps the stream. false, 0, no and
+    off (trimmed, any case) turn it off: the request carries
+    stream: false and the whole turn prints as one chunk. Any other
+    value fails, so a typo never changes the wire."""
+    try:
+        env = world.get("env")
+    except KeyError:
+        env = {}
+    raw = (env.get("WISP_LLM_STREAM") or "").strip().lower()
+    if not raw:
+        return True
+    if raw in STREAM_OFF_WORDS:
+        return False
+    fail(world, "unknown WISP_LLM_STREAM %s (leave it unset for a stream,"
+         " or set false, 0, no or off)" % raw)
+
+
 def auth_headers_of(world: World, provider: str) -> dict:
     """Auth headers per provider. Bearer serves openai-chat and
     openai-responses, and a LiteLLM proxy accepts Bearer on its
@@ -2936,7 +2996,8 @@ def anthropic_system_text(records: list) -> str:
 
 
 class Llm:
-    """One streamed chat-completions turn at one level of intent.
+    """One chat-completions turn at one level of intent, streamed or
+    whole, depending on WISP_LLM_STREAM.
 
     turn(records) -> {"assistant": record, "finish_reason": str,
       "cached_tokens": int}. Usage chunk copies land in <sessiondir>/wisp.usage
@@ -2953,7 +3014,7 @@ class Llm:
         world = self._world
         body = build_request(world, records)
         acc = TurnAcc(self._think_fields)
-        for payload in sse_stream(world, body):
+        for payload in turn_stream(world, body):
             acc.apply_delta(payload)
 
         if acc.usage:
@@ -3381,6 +3442,10 @@ def items_of_anthropic(rec: dict) -> list:
 def body_of_chat(world: World, records: list) -> dict:
     """The openai-chat body, exactly as before the provider layer.
 
+    WISP_LLM_STREAM=false sends stream false and drops stream_options;
+    every other key keeps its place, so the message prefix stays
+    byte-stable.
+
     The steer tag applies to user text before message_of builds the
     message - the same pre-mapper surgery the other builders do - so
     a user record with attachments carries them in its text part and
@@ -3407,9 +3472,10 @@ def body_of_chat(world: World, records: list) -> dict:
         "model": world.get("model"),
         "messages": messages,
         "tools": TOOLS_SPEC,
-        "stream": True,
-        "stream_options": {"include_usage": True},
+        "stream": stream_enabled_of(world),
     }
+    if body["stream"]:
+        body["stream_options"] = {"include_usage": True}
     thinking = world.get("thinking")
     if thinking:
         body["reasoning_effort"] = thinking
@@ -3563,6 +3629,9 @@ def build_request(world: World, records: list) -> dict:
     stable per record, so prefixes stay stable too.
     """
     provider = provider_of(world)
+    if provider != "openai-chat" and not stream_enabled_of(world):
+        fail(world, "WISP_LLM_STREAM=false needs WISP_LLM_API=openai-chat"
+             " (got %s)" % provider)
     if provider == "openai-chat":
         return body_of_chat(world, records)
     if provider == "openai-responses":
@@ -3757,6 +3826,56 @@ def stream_error_of(payload: dict) -> str:
     return ""
 
 
+def chat_chunk_of(payload: Any) -> dict | None:
+    """One non-stream chat-completion body as one chat-shaped chunk,
+    or None when the body is not a JSON object with choices.
+
+    message.content maps to delta.content and every present
+    DEFAULT_THINK_FIELDS key copies over. Each message.tool_calls
+    entry maps to delta.tool_calls with index set to its position:
+    TurnAcc merges calls by index, so unindexed calls would collapse
+    into one block with concatenated arguments. finish_reason and the
+    top-level usage ride along."""
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        message = {}
+    delta = {}
+    content = message.get("content")
+    if content:
+        delta["content"] = content
+    for field in DEFAULT_THINK_FIELDS.split(","):
+        if message.get(field):
+            delta[field] = message[field]
+    calls = []
+    for position, call in enumerate(message.get("tool_calls") or []):
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function")
+        if not isinstance(fn, dict):
+            fn = {}
+        calls.append({
+            "index": position,
+            "id": call.get("id"),
+            "type": call.get("type") or "function",
+            "function": {"name": fn.get("name"),
+                         "arguments": fn.get("arguments") or ""},
+        })
+    if calls:
+        delta["tool_calls"] = calls
+    chunk = {"choices": [{"delta": delta,
+                          "finish_reason": choice.get("finish_reason")}]}
+    usage = payload.get("usage")
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
+
+
 def chunk_of(provider: str, payload: dict) -> dict | None:
     """One stream payload as one chat-shaped chunk, or None.
 
@@ -3893,6 +4012,60 @@ def sse_stream(world: World, body: dict) -> Iterator[dict]:
                   "the endpoint stream carried no completion payload"
                   " (lines=%s payloads=%s first line: %s%s)"
                   % (lines, payloads, detail, request_note_of(meta)))
+
+
+def json_turn(world: World, body: dict) -> Iterator[dict]:
+    """One non-stream chat request as a one-chunk turn.
+
+    The whole body comes back in one read; chat_chunk_of turns it into
+    the chunk shape TurnAcc eats, and one `data:` line prints, so
+    wisp.stream, render-live and render-past need no new branch. The
+    log lines match sse_stream: one http post line before the request,
+    one http_error line on a transport failure, and one http_done line
+    with mode=json on success. A body with an error object or no
+    choices fails with the same 'model endpoint returned' wording
+    sse_stream uses."""
+    provider = provider_of(world)
+    url = (world.get("env").get("WISP_LLM_URL", "").rstrip("/")
+           + path_of(provider))
+    headers = auth_headers_of(world, provider)
+    http = world.get("http")
+    meta = {}
+    out = world.get("stdout")
+    started = world.get("clock").ms()
+    safe_log(world, "http", "post", "url=%s" % url,
+             "bytes=%s" % len(json.dumps(body).encode("utf-8")))
+    try:
+        payload = http.post_json(url, headers, body, meta)
+    except HttpError as exc:
+        safe_log(world, "http_error", "url=%s" % url,
+                 "ms=%s" % (world.get("clock").ms() - started),
+                 "err=%s" % str(exc)[:300],
+                 *trace_fields_of(meta))
+        raise
+    chunk = chat_chunk_of(payload)
+    if chunk is None:
+        detail = (stream_error_of(payload)
+                  if isinstance(payload, dict) else "")
+        raw = json.dumps(payload, ensure_ascii=False)
+        detail = (detail or error_text_of(raw) or raw)[:200]
+        safe_log(world, "streamfail", "url=%s" % url, "mode=json",
+                 "first=%s" % detail, *trace_fields_of(meta))
+        fail(world, "model endpoint returned an unexpected response:"
+             " %s%s" % (detail, request_suffix_of(meta)))
+    out.write("data: %s\n" % json.dumps(chunk, ensure_ascii=False))
+    safe_log(world, "http_done", "url=%s" % url, "mode=json",
+             "payloads=1", "ms=%s" % (world.get("clock").ms() - started),
+             *trace_fields_of(meta))
+    yield chunk
+
+
+def turn_stream(world: World, body: dict) -> Iterator[dict]:
+    """The one turn entry: streamed chunks, or one whole-body chunk
+    when WISP_LLM_STREAM turns streaming off."""
+    if stream_enabled_of(world):
+        return sse_stream(world, body)
+    return json_turn(world, body)
 
 
 # --- skills and AGENTS.md ---------------------------------------------------------
