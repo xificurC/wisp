@@ -47,7 +47,7 @@ start_fake() { # mode
         port="$(tr -d '[:space:]' < "$TESTDIR/port.txt" 2>/dev/null)"
         case "$port" in
             ""|*[!0-9]*) ;;
-            *)  export WISP_LLM_URL="http://127.0.0.1:$port"
+            *)  export WISP_LLM_URL="http://127.0.0.1:$port/v1/chat/completions"
                 return 0 ;;
         esac
         kill -0 "$FAKE_PID" 2>/dev/null || return 1

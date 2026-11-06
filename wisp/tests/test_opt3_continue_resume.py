@@ -75,13 +75,6 @@ class _Stdin:
         raise AssertionError("wisp continue read stdin")
 
 
-class _Http:
-    """refresh_model_cfg stays best-effort: this one always fails."""
-
-    def get_json(self, url, headers):
-        raise IOError("no model info in tests")
-
-
 class _Opts:
     def __init__(self, sessiondir):
         self.sessiondir = sessiondir
@@ -123,9 +116,8 @@ class _Harness:
         self.world.set("session", wisp.Session(self.world))
         self.world.set("stderr", io.StringIO())
         self.world.set("stdin", _Stdin())
-        self.world.set("http", _Http())
         self.world.set("sessiondir", self.sessiondir)
-        self.world.set("env", {"WISP_LLM_URL": "u",
+        self.world.set("env", {"WISP_LLM_URL": "http://u/v1/chat/completions",
                                "WISP_LLM_API_KEY": "k"})
 
     def seed(self, records):

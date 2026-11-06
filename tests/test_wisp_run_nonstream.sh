@@ -53,7 +53,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 done
 
 if [ -n "$PORT" ]; then
-    export WISP_LLM_URL="http://127.0.0.1:$PORT"
+    export WISP_LLM_URL="http://127.0.0.1:$PORT/v1/chat/completions"
     export WISP_LLM_API_KEY=fake-key
     export WISP_LLM_STREAM=false
     C="$($WISP new --name ns -m test-model)"

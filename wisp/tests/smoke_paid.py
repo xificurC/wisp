@@ -10,16 +10,15 @@ unittest discovery (name does not match test*.py); run by hand:
 
 The test reads four variables from the environment:
 
-    WISP_LLM_URL            the chat-completions base URL
+    WISP_LLM_URL            the full request URL for that shape
     WISP_LLM_API_KEY        the key for that URL
     WISP_SMOKE_MODEL        the model id to call
     WISP_SMOKE_FALLBACK_MODEL   optional second model, tried when the
                                 first one fails
 
 A per-provider override also works: WISP_SMOKE_MODEL_ANTHROPIC,
-WISP_SMOKE_MODEL_RESPONSES, WISP_SMOKE_MODEL_CHAT. The URL and the key
-are the same for all three providers, because the provider shapes are
-selected by WISP_LLM_API.
+WISP_SMOKE_MODEL_RESPONSES, WISP_SMOKE_MODEL_CHAT. Each shape has its
+own path, so run one shape per URL; wisp appends nothing to the URL.
 
 Four small turns: prefix plant, cache-read check, tool call (with
 thinking on anthropic), signature/encrypted replay. Asserts cached
@@ -115,7 +114,6 @@ def main() -> int:
     env["WISP_LLM_API"] = API_OF[provider]
     if provider == "anthropic":
         env["WISP_LLM_MAX_TOKENS"] = "4096"
-        env["WISP_LLM_THINKING_BUDGET"] = "2048"
 
     if attach:
         return attach_smoke(wisp, env, provider, model)

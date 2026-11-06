@@ -97,22 +97,6 @@ class _Tools:
         return [_tool(c.get("id")) for c in calls]
 
 
-class _Http:
-    """refresh_model_cfg stays best-effort: this one always fails."""
-
-    def get_json(self, url, headers):
-        raise IOError("no model info in tests")
-
-
-class _HttpFetch:
-    """/v1/model/info that answers with one model m."""
-
-    def get_json(self, url, headers):
-        assert url == "u/v1/model/info"
-        return {"data": [{"model_name": "m",
-                          "model_info": {"max_input_tokens": 100000}}]}
-
-
 class _Opts:
     def __init__(self, sessiondir, context_guard=None):
         self.sessiondir = sessiondir
@@ -168,9 +152,8 @@ class _Harness:
         self.world.set("session", wisp.Session(self.world))
         self.world.set("stderr", io.StringIO())
         self.world.set("stdout", io.StringIO())
-        self.world.set("http", _Http())
         self.world.set("sessiondir", self.sessiondir)
-        self.world.set("env", {"WISP_LLM_URL": "u",
+        self.world.set("env", {"WISP_LLM_URL": "http://u/v1/chat/completions",
                                "WISP_LLM_API_KEY": "k"})
 
     def modelcfg(self, window):
@@ -373,16 +356,19 @@ class PercentGuardTest(unittest.TestCase):
             # Nothing ran: no prompt record reached the jsonl.
             self.assertEqual(h.jsonl(), [])
 
-    def test_percent_fetches_modelcfg_on_a_fresh_session(self):
+    def test_percent_copies_the_model_info_file_on_a_fresh_session(self):
         with tempfile.TemporaryDirectory() as temp:
             h = _Harness(temp)
-            # No wisp.modelcfg at start; the endpoint answers.
-            h.world.set("http", _HttpFetch())
+            # No wisp.modelcfg at start; the file carries the table.
+            infopath = os.path.join(temp, "models.json")
+            with open(infopath, "w") as fh:
+                json.dump({"m": {"context": 100000}}, fh)
+            h.world.get("env")["WISP_LLM_MODEL_INFO_FILE"] = infopath
             rc = h.run("work",
                        _Llm([_turn_tool(prompt=7000), _turn_stop()]),
                        guard="5%")
             self.assertEqual(rc, 75)
-            # The guard fetched and wrote the modelcfg it needed.
+            # The guard copied and wrote the modelcfg it needed.
             with open(os.path.join(h.sessiondir, "wisp.modelcfg")) as fh:
                 table = json.loads(fh.read())
             self.assertEqual(table["m"]["context"], 100000)

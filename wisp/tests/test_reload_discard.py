@@ -61,7 +61,7 @@ class _Harness:
         self.world.set("clock", wisp.Clock(self.world))
         self.world.set("session", wisp.Session(self.world))
         self.world.set("sessiondir", self.sessiondir)
-        self.world.set("env", {"WISP_LLM_URL": "u",
+        self.world.set("env", {"WISP_LLM_URL": "http://u/v1/chat/completions",
                                "WISP_LLM_API_KEY": "k"})
 
     def write(self, records):

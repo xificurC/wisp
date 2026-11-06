@@ -45,7 +45,7 @@ done
 PORT="$(head -1 "$TESTDIR/port")"
 
 if [ -n "$PORT" ]; then
-    export WISP_LLM_URL="http://127.0.0.1:$PORT"
+    export WISP_LLM_URL="http://127.0.0.1:$PORT/v1/chat/completions"
     export WISP_LLM_API_KEY="k"
     export WISP_LLM_API="openai-chat"
     C1="$($WISP new --name t1 -m test-model)"

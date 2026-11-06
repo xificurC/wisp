@@ -3,13 +3,26 @@
 wisp speaks to three request shapes. It has no vendor library. It builds
 JSON, sends it with `urllib`, and reads the SSE stream.
 
+## The URL
+
+`WISP_LLM_URL` is the full request URL: scheme, host, path and query.
+wisp appends nothing. A version path, a deployment prefix, and a query
+string land as written, which is what Azure, Gemini's OpenAI-compatible
+route, and a LiteLLM proxy need.
+
+Start checks: the scheme must be `http` or `https`, and the path must
+not be empty. A bare origin such as `https://my-llm.endpoint` fails
+with `WISP_LLM_URL has no path`; write
+`https://my-llm.endpoint/v1/chat/completions` instead.
+`WISP_LLM_API` selects the body and stream grammar only.
+
 ## The three shapes
 
-| Name | Endpoint | Auth header | System prompt |
+| Name | Example path | Auth header | System prompt |
 |---|---|---|---|
-| `openai-chat` | `/chat/completions` | `Authorization: Bearer` | A message in the list |
-| `openai-responses` | `/responses` | `Authorization: Bearer` | A top-level `instructions` field |
-| `anthropic` | `/messages` | `x-api-key` plus a version header | A top-level `system` field |
+| `openai-chat` | `/v1/chat/completions` | `Authorization: Bearer` | A message in the list |
+| `openai-responses` | `/v1/responses` | `Authorization: Bearer` | A top-level `instructions` field |
+| `anthropic` | `/v1/messages` | `Authorization: Bearer` | A top-level `system` field |
 
 The shapes differ in more than the path:
 
@@ -57,12 +70,81 @@ test can assert the bytes; only the backend can assert the hit.
 ## The model config
 
 `wisp.modelcfg` holds one entry per model: the context window and the
-prices per million tokens. wisp fills it from one `/v1/model/info`
-fetch, best effort.
+prices per million tokens. wisp fetches no model info. Point
+`WISP_LLM_MODEL_INFO_FILE` at a JSON file with the same shape, and each
+run copies the file into `wisp.modelcfg` before the first round.
 
-A failed fetch warns and writes nothing. The run keeps going. A model
-with no entry renders `<noprice>` and `<nocontext>`. Only percent-mode
-guards need the window, and a missing window fails that mode at start.
+``` shell
+export WISP_LLM_MODEL_INFO_FILE=$HOME/.config/wisp/models.json
+```
+
+A missing, broken, or empty file warns and writes nothing, so a
+hand-written `wisp.modelcfg` survives. Unset means no copy and no
+warning. A model with no entry renders `<noprice>` and `<nocontext>`.
+Only percent-mode guards need the window, and a missing window fails
+that mode at start.
+
+### Recipes
+
+Every provider publishes model facts in its own shape. One `jq` call
+turns the published list into the file wisp reads. Prices drift, so
+treat each file as a snapshot.
+
+OpenCode Go publishes `limit.context` and per-million `cost`:
+
+``` shell
+curl -s -H "Authorization: Bearer $OPENCODE_API_KEY" \
+     -H "User-Agent: wisp" \
+     https://opencode.ai/zen/go/v1/models \
+  | jq 'reduce .data[] as $m ({};
+        .[$m.id] = {
+          context: ($m.limit.context // 0),
+          input: ($m.cost.text.input.price // 0),
+          output: ($m.cost.text.output.price // 0),
+          cacheRead: ($m.cost.text.input.cache.read // 0),
+          cacheWrite: ($m.cost.text.input.cache.write // 0)})' \
+  > "$HOME/.config/wisp/models.json"
+```
+
+OpenRouter publishes `context_length` and per-token `pricing`:
+
+``` shell
+curl -s https://openrouter.ai/api/v1/models \
+  | jq 'reduce .data[] as $m ({};
+        .[$m.id] = {
+          context: ($m.context_length // 0),
+          input: (($m.pricing.prompt // "0") | tonumber) * 1000000,
+          output: (($m.pricing.completion // "0") | tonumber) * 1000000,
+          cacheRead: (($m.pricing.input_cache_read // "0") | tonumber) * 1000000,
+          cacheWrite: (($m.pricing.input_cache_write // "0") | tonumber) * 1000000})' \
+  > "$HOME/.config/wisp/models.json"
+```
+
+LiteLLM publishes one table keyed by model with its own key names:
+
+``` shell
+curl -s https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json \
+  | jq 'del(.sample_spec)
+        | with_entries(
+          select(.value.input_cost_per_token != null)
+          | .value = {
+              context: (.value.max_input_tokens // 0),
+              input: (.value.input_cost_per_token * 1000000),
+              output: ((.value.output_cost_per_token // 0) * 1000000),
+              cacheRead: ((.value.cache_read_input_token_cost // 0) * 1000000),
+              cacheWrite: ((.value.cache_creation_input_token_cost // 0) * 1000000)})' \
+  > "$HOME/.config/wisp/models.json"
+```
+
+`del(.sample_spec)` drops the table's one documentation entry, whose
+fields are English sentences; wisp rejects a table whose entries are
+not numbers. Each recipe rewrites the whole file, so give every backend
+its own name when you use several.
+
+Anthropic's `/v1/models` and OpenAI's `/v1/models` name no price. For
+those, write the file by hand, or take the LiteLLM table above.
+`AI_SETUP_RECIPES.md` at the project root holds one full environment
+block per backend, the model-info file included.
 
 ## The paid smoke test
 
@@ -74,7 +156,7 @@ It reads four variables from the environment:
 
 | Variable | Holds |
 |---|---|
-| `WISP_LLM_URL` | The chat-completions base URL |
+| `WISP_LLM_URL` | The full request URL |
 | `WISP_LLM_API_KEY` | The key |
 | `WISP_SMOKE_MODEL` | The model id to call |
 | `WISP_SMOKE_FALLBACK_MODEL` | A second model, tried when the first fails |
@@ -97,4 +179,31 @@ works. It proves the wire path works.
 This note names no model and quotes no price. The endpoint changes, and
 the prices change. A list in a README goes stale in a month.
 
-Put the model in the environment. Read the price from `wisp.modelcfg`.
+Put the model in the environment. Fill `wisp.modelcfg` from
+`WISP_LLM_MODEL_INFO_FILE`, which is a caller snapshot of the
+provider's list.
+
+## Extra headers
+
+`WISP_LLM_HEADERS` holds one JSON object of extra request headers and
+lands last. Names match case-insensitively, so `authorization`
+replaces `Authorization` instead of adding a second header. A JSON
+`null` deletes a header: `{"Authorization": null}` reaches a no-auth
+local endpoint. A value may carry `{session}`, the session dir's base
+name, and `{key}`, `WISP_LLM_API_KEY`, so a backend with its own auth
+header needs no duplicated export.
+
+Every shape sends `Content-Type`, `User-Agent: wisp`, and
+`Authorization: Bearer {key}`. wisp pre-includes no vendor header. A
+native Anthropic endpoint therefore needs
+`{"anthropic-version": "2026-10-21"}`, and a legacy deployment that
+wants `x-api-key` sets
+`{"x-api-key": "{key}", "Authorization": null}`.
+
+The key check runs on the resolved table: a run fails only when a
+surviving value still holds `{key}` and the key is empty, so a no-auth
+endpoint needs no key.
+
+wisp names itself in `User-Agent` (`wisp`), never the HTTP library: a
+library name sits on a blocklist. `md/notes/opencode-go.md` is the
+worked example.

@@ -12,8 +12,8 @@ non-stream chat.completion body: text plus usage. Mode json_two serves
 round one as two non-stream tool calls and every later round as a
 final text answer plus usage; both json modes answer 400 with the
 proxy's stream refusal when the request body says stream: true, so the
-non-stream body gate stays pinned. Serves GET /v1/model/info with an
-empty table. Writes each POST body to $FAKE_LLM_CAPTURE, one JSON line
+non-stream body gate stays pinned. Answers any GET with an empty JSON
+table. Writes each POST body to $FAKE_LLM_CAPTURE, one JSON line
 per request, when that env is set. Binds port 0 when PORT is 0 or
 absent, prints the chosen port on one stdout line, and serves after
 that line. No fixed ports. Usage: fake_llm_sse.py [PORT] [MODE]. Runs
