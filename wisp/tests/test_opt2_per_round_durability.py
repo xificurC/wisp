@@ -97,7 +97,7 @@ class _Harness:
         self.world.set("model", "m")
         self.world.set("thinking", None)
         self.world.set("sessiondir", self.sessiondir)
-        self.world.set("env", {"WISP_LLM_URL": "u",
+        self.world.set("env", {"WISP_LLM_URL": "http://u/v1/chat/completions",
                                "WISP_LLM_API_KEY": "k"})
         with open(os.path.join(self.sessiondir, "wisp.jsonl"), "w") as h:
             h.write("")

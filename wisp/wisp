@@ -60,8 +60,12 @@ agents-md and build-system-prompt take no -d; they scan the CWD walk
 and the user-level places.
 
 Env: WISP_SESSION_DIR, WISP_SESSIONS_ROOT, WISP_LLM_URL, WISP_LLM_API_KEY,
-WISP_LLM_MAX_TURNS, WISP_LLM_STREAM. WISP_LLM_STREAM=false sends one
-non-stream chat request per turn and prints the whole turn as one chunk.
+WISP_LLM_MAX_TURNS, WISP_LLM_STREAM, WISP_LLM_HEADERS,
+WISP_LLM_MODEL_INFO_FILE. WISP_LLM_URL is the full request URL; wisp appends
+nothing. WISP_LLM_STREAM=false sends one non-stream chat request per turn
+and prints the whole turn as one chunk. WISP_LLM_HEADERS is one JSON object
+of extra request headers. WISP_LLM_MODEL_INFO_FILE names a JSON model table
+that wisp copies into wisp.modelcfg.
 """
 
 from __future__ import annotations
@@ -81,6 +85,7 @@ import sys
 import traceback
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 from datetime import datetime
@@ -145,15 +150,39 @@ def fail(world: World, message: str) -> None:
     raise SystemExit(1)
 
 
+SECRET_QUERY_WORDS = ("key", "token", "secret")
+"""Query-pair name fragments whose value safe_log hides."""
+
+QUERY_PAIR_PATTERN = re.compile(r"([?&])([^=&\s]+)=([^&\s]*)")
+
+
+def redact_query_of(text: str) -> str:
+    """Hide the value of every query pair whose name names a secret.
+
+    A provider puts the key in the URL as often as in a header, so a
+    logged URL would leak it. The name test is a case-insensitive
+    substring, because vendors spell one idea api-key, apiKey and
+    x-goog-api-key. Nothing outside a query pair changes."""
+    def replace(match: Any) -> str:
+        name = match.group(2)
+        if any(word in name.lower() for word in SECRET_QUERY_WORDS):
+            return "%s%s=<redacted>" % (match.group(1), name)
+        return match.group(0)
+    return QUERY_PAIR_PATTERN.sub(replace, text)
+
+
 def safe_log(world: World, event: str, *fields: str) -> None:
     """One wisp.log line through the session service; never raises.
 
     A failure that lands before the session dir is set drops the
     line, so observability cannot turn one clean failure into a
     second one. Every event that runs outside the normal turn flow
-    - process exit, crashes, HTTP errors - logs through this."""
+    - process exit, crashes, HTTP errors - logs through this. Every
+    field passes redact_query_of first, so a URL-borne key never
+    reaches wisp.log."""
     try:
-        world.get("session").log(event, *fields)
+        world.get("session").log(
+            event, *(redact_query_of(str(field)) for field in fields))
     except (KeyError, AttributeError, TypeError, OSError):
         pass
 
@@ -687,6 +716,18 @@ def install_exit_signals(world: World) -> None:
             pass
 
 
+def check_request_of(world: World) -> None:
+    """The start checks every run and continue share.
+
+    A full URL with a scheme and a path, a known request shape, and a
+    resolvable header table. The key check lives in auth_headers_of,
+    so a no-auth endpoint needs no key, and a missing key fails here
+    before the prompt is read instead of after the run commits it."""
+    request_url_of(world)
+    provider_of(world)
+    auth_headers_of(world)
+
+
 def load_session_state(world: World, opts: Any) -> tuple:
     """Bind the session dir, load its setup and its committed records.
 
@@ -699,6 +740,7 @@ def load_session_state(world: World, opts: Any) -> tuple:
     setup = world.get("session").load_run_setup(opts.sessiondir)
     world.set("model", setup["model"])
     world.set("thinking", setup.get("thinking"))
+    check_request_of(world)
     records, committed = world.get("session").load_events()
     world.set("committed", committed)
     return setup, records
@@ -1056,10 +1098,10 @@ def context_guard_of(world: World, raw) -> dict | None:
     needs no modelcfg and carries no window.
 
     A fresh session has no wisp.modelcfg until a run writes it, and
-    the run writes it after this call, so percent mode fetches the
-    modelcfg itself first - the same best-effort /v1/model/info call
-    refresh_model_cfg makes - and fails only when the fetch leaves
-    no window either."""
+    the run writes it after this call, so percent mode copies the
+    file itself first - the same best-effort WISP_LLM_MODEL_INFO_FILE
+    read refresh_model_cfg makes - and fails only when the copy
+    leaves no window either."""
     if raw is None:
         return None
     spec = parse_context_guard(world, raw)
@@ -1393,6 +1435,29 @@ def read_usage_chunks(world: World, path: str) -> dict:
         state["turns"] += 1
         state["last_total"] = int(usage.get("total_tokens") or 0)
     return state
+
+
+MODELCFG_FIELDS = ("context", "input", "output", "cacheRead", "cacheWrite")
+"""The per-model keys wisp.modelcfg and WISP_LLM_MODEL_INFO_FILE share."""
+
+
+def model_table_ok_of(table: Any) -> bool:
+    """Whether one parsed table has the wisp.modelcfg shape: a
+    non-empty JSON object of JSON objects, with a number in every
+    known field it holds. An unknown extra key passes, so a wider
+    provider table still loads."""
+    if not isinstance(table, dict) or not table:
+        return False
+    for entry in table.values():
+        if not isinstance(entry, dict):
+            return False
+        for name in MODELCFG_FIELDS:
+            value = entry.get(name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+    return True
 
 
 def read_model_cfg(world: World, path: str, model: str) -> dict | None:
@@ -1919,9 +1984,15 @@ def command_help_text(cmd: str) -> str:
             "all work on it. Percent mode fails at start when",
             "wisp.modelcfg holds no context window for the model.",
             "Env: WISP_SESSION_DIR, WISP_LLM_URL, WISP_LLM_API_KEY,",
-            "WISP_LLM_MAX_TURNS, WISP_LLM_STREAM.",
-            "WISP_LLM_STREAM=false sends one non-stream chat request",
-            "and prints the turn as one chunk.",
+            "WISP_LLM_MAX_TURNS, WISP_LLM_STREAM, WISP_LLM_HEADERS,",
+            "WISP_LLM_MODEL_INFO_FILE.",
+            "WISP_LLM_URL is the full request URL; wisp appends",
+            "nothing. WISP_LLM_STREAM=false sends one non-stream chat",
+            "request and prints the turn as one chunk.",
+            "WISP_LLM_HEADERS is one JSON object of extra request",
+            "headers; a value may hold {session} and {key}, and a null",
+            "deletes a header. WISP_LLM_MODEL_INFO_FILE is a JSON model",
+            "table copied into wisp.modelcfg.",
         ]) + "\n",
         "continue": "\n".join([
             "wisp continue: finish an open segment without a new prompt.",
@@ -1940,9 +2011,15 @@ def command_help_text(cmd: str) -> str:
             "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp",
             "continue fails. The session dir must hold wisp.jsonl.",
             "Env: WISP_SESSION_DIR, WISP_LLM_URL, WISP_LLM_API_KEY,",
-            "WISP_LLM_MAX_TURNS, WISP_LLM_STREAM.",
-            "WISP_LLM_STREAM=false sends one non-stream chat request",
-            "and prints the turn as one chunk.",
+            "WISP_LLM_MAX_TURNS, WISP_LLM_STREAM, WISP_LLM_HEADERS,",
+            "WISP_LLM_MODEL_INFO_FILE.",
+            "WISP_LLM_URL is the full request URL; wisp appends",
+            "nothing. WISP_LLM_STREAM=false sends one non-stream chat",
+            "request and prints the turn as one chunk.",
+            "WISP_LLM_HEADERS is one JSON object of extra request",
+            "headers; a value may hold {session} and {key}, and a null",
+            "deletes a header. WISP_LLM_MODEL_INFO_FILE is a JSON model",
+            "table copied into wisp.modelcfg.",
         ]) + "\n",
         "steer": "\n".join([
             "wisp steer: queue one steering message for the session's runs.",
@@ -2501,7 +2578,8 @@ class Session:
     commit_events(new_records): append new records; the round loop
       and the exit commit both call it through flush_records, which
       owns the shared commit point in world.
-    refresh_model_cfg(): best-effort /v1/model/info into wisp.modelcfg.
+    refresh_model_cfg(): best-effort copy of WISP_LLM_MODEL_INFO_FILE
+      into wisp.modelcfg.
     log(event, *fields): one wisp.log line, ms UTC timestamp first.
     write_run_setup(path, model, thinking, parent): persist them;
       thinking and the parent link only when set.
@@ -2553,12 +2631,6 @@ class Session:
         fs.write_text(path + "/wisp.usage", "")
 
     def load_events(self) -> tuple:
-        env = self._world.get("env")
-        if not env.get("WISP_LLM_URL"):
-            fail(self._world, "WISP_LLM_URL is not set")
-        if not env.get("WISP_LLM_API_KEY"):
-            fail(self._world, "WISP_LLM_API_KEY is not set")
-
         world, fs, sessiondir = self._world, self._world.get("fs"), self._world.get("sessiondir")
         path = sessiondir + "/wisp.jsonl"
         fs.mkdir(sessiondir)
@@ -2643,42 +2715,41 @@ class Session:
         self.log("commit", "records=%s" % len(new_records))
 
     def refresh_model_cfg(self) -> None:
-        """One best-effort /v1/model/info fetch into wisp.modelcfg.
+        """Copy the WISP_LLM_MODEL_INFO_FILE table into wisp.modelcfg.
 
-        On any failure warn on stderr, write nothing, keep running.
-        Costs map to per-1M rates; the shape matches wisp.modelcfg.
-        """
+        The caller gets the file from the provider; wisp fetches no
+        model info. The file holds one JSON object keyed by model, the
+        shape wisp.modelcfg already has: context plus per-million
+        input, output, cacheRead and cacheWrite. Unset means nothing
+        happens and nothing warns. A missing, broken, or empty file
+        warns on stderr and writes nothing, so a hand-written
+        wisp.modelcfg survives."""
         world = self._world
-        url = world.get("env").get("WISP_LLM_URL", "").rstrip("/")
-        key = world.get("env").get("WISP_LLM_API_KEY", "")
+        env = world.get("env")
+        path = (env.get("WISP_LLM_MODEL_INFO_FILE") or "").strip()
+        if not path:
+            return
+        path = expand_tilde(env, path)
         try:
-            data = world.get("http").get_json(
-                url + "/v1/model/info", {"Authorization": "Bearer %s" % key})
-        except Exception as exc:
-            world.get("stderr").write(
-                "wisp: warning: cannot fetch model config from %s (%s)\n" % (url, exc))
-            self.log("modelcfg", "error=%s" % str(exc)[:300])
+            table = json.loads(world.get("fs").read_text(path))
+        except (OSError, ValueError) as exc:
+            self._modelcfg_warning(path, str(exc))
             return
-        table = {}
-        for entry in data.get("data") or []:
-            name = entry.get("model_name")
-            if not name:
-                continue
-            info = entry.get("model_info") or {}
-            table[name] = {
-                "context": info.get("max_input_tokens") or 0,
-                "input": (info.get("input_cost_per_token") or 0) * 1000000,
-                "output": (info.get("output_cost_per_token") or 0) * 1000000,
-                "cacheRead": (info.get("cache_read_input_token_cost") or 0) * 1000000,
-                "cacheWrite": (info.get("cache_creation_input_token_cost") or 0) * 1000000,
-            }
-        if not table:
-            world.get("stderr").write(
-                "wisp: warning: model config from %s has no usable entries\n" % url)
+        if not model_table_ok_of(table):
+            self._modelcfg_warning(path, "not a JSON object of model entries")
             return
-        world.get("fs").write_text(world.get("sessiondir") + "/wisp.modelcfg",
-                                   json.dumps(table, sort_keys=True) + "\n")
-        self.log("modelcfg", "written=1")
+        world.get("fs").write_text(
+            world.get("sessiondir") + "/wisp.modelcfg",
+            json.dumps(table, sort_keys=True) + "\n")
+        self.log("modelcfg", "written=1", "models=%s" % len(table))
+
+    def _modelcfg_warning(self, path: str, detail: str) -> None:
+        """One stderr line and one log line for a model-info file that
+        did not load; the run keeps going."""
+        self._world.get("stderr").write(
+            "wisp: warning: cannot read model config from %s (%s)\n"
+            % (path, detail[:300]))
+        self.log("modelcfg", "error=%s" % detail[:300])
 
     def log(self, event: str, *fields: str) -> None:
         line = "%s %s %s\n" % (self._world.get("clock").ms(), event, " ".join(fields))
@@ -2888,13 +2959,14 @@ class Tools:
 DEFAULT_MAX_TOKENS = 4096
 """The anthropic max_tokens cap per turn; WISP_LLM_MAX_TOKENS overrides."""
 
-DEFAULT_THINKING_BUDGET = 8192
-"""The anthropic thinking budget per turn; WISP_LLM_THINKING_BUDGET overrides."""
-
-ANTHROPIC_MIN_BUDGET = 1024
-"""The smallest thinking budget the anthropic API accepts."""
-
 PROVIDERS = ("openai-chat", "openai-responses", "anthropic")
+
+USER_AGENT = "wisp"
+"""The request user agent: a client names itself, never the HTTP library.
+
+urllib sends Python-urllib by default, which sits on blocklists - an
+OpenCode Go turn answered 403 error code 1010 until wisp named itself.
+WISP_LLM_HEADERS overrides the value."""
 
 
 def provider_of(world: World) -> str:
@@ -2940,31 +3012,104 @@ def stream_enabled_of(world: World) -> bool:
          " or set false, 0, no or off)" % raw)
 
 
-def auth_headers_of(world: World, provider: str) -> dict:
-    """Auth headers per provider. Bearer serves openai-chat and
-    openai-responses, and a LiteLLM proxy accepts Bearer on its
-    /v1/messages route too, so anthropic through LiteLLM stays
-    Bearer; WISP_LLM_ANTHROPIC_VERSION adds the version header when
-    the endpoint is a native Anthropic one that asks for it."""
-    key = world.get("env").get("WISP_LLM_API_KEY", "")
-    headers = {"Content-Type": "application/json"}
-    if provider == "anthropic":
-        headers["x-api-key"] = key
-        version = world.get("env").get("WISP_LLM_ANTHROPIC_VERSION")
-        if version:
-            headers["anthropic-version"] = version
-    else:
-        headers["Authorization"] = "Bearer %s" % key
-    return headers
+def session_key_of(world: World) -> str:
+    """The session dir's base name: the stable conversation id.
+
+    One conversation gets one id wherever a backend accepts one: the
+    x-opencode-session header, the codex session-id header, and the
+    prompt_cache_key body field. Two runs on one session dir share a
+    route and a cache shard."""
+    try:
+        return os.path.basename(str(world.get("sessiondir")).rstrip("/"))
+    except KeyError:
+        return ""
 
 
-def path_of(provider: str) -> str:
-    """The endpoint path per provider."""
-    if provider == "openai-chat":
-        return "/v1/chat/completions"
-    if provider == "openai-responses":
-        return "/v1/responses"
-    return "/v1/messages"
+def request_url_of(world: World) -> str:
+    """The full request URL from WISP_LLM_URL; wisp appends nothing.
+
+    The value carries scheme, host, path and query, so a version
+    path, a deployment prefix, or a gateway prefix lands as written.
+    Start checks: the scheme is http or https, and the path is not
+    empty - a bare origin fails here instead of answering 404 later."""
+    env = world.get("env")
+    url = (env.get("WISP_LLM_URL") or "").strip()
+    if not url:
+        fail(world, "WISP_LLM_URL is not set")
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        fail(world, "WISP_LLM_URL needs an http or https URL: %s"
+             % redact_query_of(url))
+    if parts.path in ("", "/"):
+        fail(world, "WISP_LLM_URL has no path: %s" % redact_query_of(url))
+    return url
+
+
+def extra_headers_of(world: World) -> dict:
+    """The WISP_LLM_HEADERS overlay: one JSON object, applied last.
+
+    A JSON null marks a deletion, not a None value: it removes the
+    default header of that name, so a no-auth endpoint drops
+    Authorization with {"Authorization": null}. A value may hold
+    {session}, replaced by the session dir's base name, and {key},
+    replaced by WISP_LLM_API_KEY, so a header carries the key without
+    a second export. A value that is not a JSON object fails the run,
+    because a header that silently does not apply would leave the
+    endpoint's refusal unexplained. The raw value never prints in an
+    error: an overlay may carry the key itself."""
+    try:
+        env = world.get("env")
+    except KeyError:
+        env = {}
+    raw = (env.get("WISP_LLM_HEADERS") or "").strip()
+    if not raw:
+        return {}
+    try:
+        table = json.loads(raw)
+    except ValueError as exc:
+        fail(world, "WISP_LLM_HEADERS is not valid JSON (%s)" % exc)
+    if not isinstance(table, dict):
+        fail(world, "WISP_LLM_HEADERS is not a JSON object")
+    return {str(name): (None if value is None else str(value))
+            for name, value in table.items()}
+
+
+def merged_headers(base: dict, extras: dict) -> dict:
+    """Apply the overlay on the base table, names case-insensitive.
+
+    A null value deletes the matching header. A non-null value
+    replaces it under the overlay's spelling, so the export names the
+    exact bytes on the wire. The base headers keep their order first."""
+    for name, value in extras.items():
+        match = next((key for key in base if key.lower() == name.lower()),
+                     None)
+        if match is not None:
+            del base[match]
+        if value is not None:
+            base[name] = value
+    return base
+
+
+def auth_headers_of(world: World) -> dict:
+    """The request headers for one turn, key check included.
+
+    Every shape sends Content-Type, User-Agent and Authorization:
+    Bearer {key}. WISP_LLM_HEADERS lands last, so a backend with
+    another auth scheme replaces or deletes the Bearer header. The
+    key check runs on the resolved table: a run fails only when a
+    surviving value still holds {key} and WISP_LLM_API_KEY is empty,
+    so a no-auth local endpoint needs no key at all."""
+    key = world.get("env").get("WISP_LLM_API_KEY") or ""
+    headers = merged_headers(
+        {"Content-Type": "application/json",
+         "User-Agent": USER_AGENT,
+         "Authorization": "Bearer {key}"},
+        extra_headers_of(world))
+    if not key and any("{key}" in value for value in headers.values()):
+        fail(world, "WISP_LLM_API_KEY is not set")
+    session = session_key_of(world)
+    return {name: value.replace("{session}", session).replace("{key}", key)
+            for name, value in headers.items()}
 
 
 def tools_spec_of(provider: str) -> list:
@@ -3327,15 +3472,14 @@ def items_of_responses(rec: dict) -> list:
 
     A system record stays a developer message item. A user record is
     one user message item. An assistant record expands to a reasoning
-    item per reasoning block (with its encrypted_content when the
-    record holds one), then one message item for the text, then one
-    function_call item per tool-call block, keyed by the stored id as
-    call_id. A tool record is one function_call_output item keyed by
-    the stored call_id. Key order is stable, so the serialized item
-    list stays byte-stable across fresh and resumed runs; reasoning
-    items without encrypted_content (older sessions, or a record the
-    provider never signed) replay as nothing - the Responses API does
-    not require reasoning items to be present.
+    item per reasoning block - the stored summary text, plus the
+    encrypted_content when the record holds one - then one message
+    item for the text, then one function_call item per tool-call
+    block, keyed by the stored id as call_id. A tool record is one
+    function_call_output item keyed by the stored call_id. Key order
+    is stable, so the serialized item list stays byte-stable across
+    fresh and resumed runs. An unsigned reasoning item still replays
+    its summary text; the Responses API does not require the blob.
     """
     kind = rec["type"]
     if kind == "system":
@@ -3351,7 +3495,9 @@ def items_of_responses(rec: dict) -> list:
         out = []
         for b in rec["output"]:
             if b["type"] == "reasoning":
-                item = {"type": "reasoning", "summary": []}
+                summary = ([{"type": "summary_text", "text": b["text"]}]
+                           if b.get("text") else [])
+                item = {"type": "reasoning", "summary": summary}
                 if b.get("encrypted_content"):
                     item["encrypted_content"] = b["encrypted_content"]
                 out.append(item)
@@ -3440,11 +3586,12 @@ def items_of_anthropic(rec: dict) -> list:
 
 
 def body_of_chat(world: World, records: list) -> dict:
-    """The openai-chat body, exactly as before the provider layer.
+    """The openai-chat body.
 
-    WISP_LLM_STREAM=false sends stream false and drops stream_options;
-    every other key keeps its place, so the message prefix stays
-    byte-stable.
+    prompt_cache_key carries the session id, the routing hint OpenAI
+    documents for the prefix cache. WISP_LLM_STREAM=false sends
+    stream false and drops stream_options; every other key keeps its
+    place, so the message prefix stays byte-stable.
 
     The steer tag applies to user text before message_of builds the
     message - the same pre-mapper surgery the other builders do - so
@@ -3479,6 +3626,9 @@ def body_of_chat(world: World, records: list) -> dict:
     thinking = world.get("thinking")
     if thinking:
         body["reasoning_effort"] = thinking
+    cache_key = session_key_of(world)
+    if cache_key:
+        body["prompt_cache_key"] = cache_key
     return body
 
 
@@ -3510,11 +3660,14 @@ def body_of_responses(world: World, records: list) -> dict:
 
     Items come from items_of_responses. The steer tag applies to
     user text before the item list is built, so prefixes stay stable
-    across rounds. The
-    system text becomes the instructions field. store false keeps the
-    run stateless; reasoning items carry their encrypted_content back.
-    Thinking maps to reasoning.effort with the same level words the
-    Responses API takes.
+    across rounds. The system text becomes the instructions field.
+    store false keeps the run stateless, so include asks for the
+    encrypted reasoning blob and each reasoning item carries the blob
+    back. Thinking maps to reasoning.effort with the same level words
+    the Responses API takes, and reasoning.summary auto asks for the
+    readable summary wisp replays. prompt_cache_key carries the
+    session id, the routing hint the vendor documents for the prefix
+    cache.
     """
     input_items = []
     instructions = ""
@@ -3535,12 +3688,16 @@ def body_of_responses(world: World, records: list) -> dict:
         "tools": tools_spec_of("openai-responses"),
         "stream": True,
         "store": False,
+        "include": ["reasoning.encrypted_content"],
     }
+    cache_key = session_key_of(world)
+    if cache_key:
+        body["prompt_cache_key"] = cache_key
     if instructions:
         body["instructions"] = instructions
     thinking = world.get("thinking")
     if thinking:
-        body["reasoning"] = {"effort": thinking}
+        body["reasoning"] = {"effort": thinking, "summary": "auto"}
     return body
 
 
@@ -3554,8 +3711,10 @@ def body_of_anthropic(world: World, records: list) -> dict:
     deepest stable prefix - the last record before the new user turn -
     so the conversation prefix, tools and system all cache; the
     breakpoint moves forward as the conversation grows. max_tokens
-    carries the run cap; thinking maps to one thinking object with a
-    budget_tokens floor, and no unknown top-level field is ever set.
+    carries the run cap. A thinking level turns adaptive thinking on
+    and rides top-level output_config.effort, so Claude decides the
+    depth and no budget_tokens enters the body. Only fields the
+    messages API names are ever set.
     """
     messages = []
     system = ""
@@ -3609,10 +3768,8 @@ def body_of_anthropic(world: World, records: list) -> dict:
                     "cache_control", {"type": "ephemeral"})
     thinking = world.get("thinking")
     if thinking:
-        budget = max(int(world.get("env").get(
-            "WISP_LLM_THINKING_BUDGET", DEFAULT_THINKING_BUDGET)),
-            ANTHROPIC_MIN_BUDGET)
-        body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        body["thinking"] = {"type": "adaptive"}
+        body["output_config"] = {"effort": thinking}
     return body
 
 
@@ -3944,9 +4101,8 @@ def sse_stream(world: World, body: dict) -> Iterator[dict]:
     is one lookup away.
     """
     provider = provider_of(world)
-    url = (world.get("env").get("WISP_LLM_URL", "").rstrip("/")
-           + path_of(provider))
-    headers = auth_headers_of(world, provider)
+    url = request_url_of(world)
+    headers = auth_headers_of(world)
     http = world.get("http")
     meta = {}
     out = world.get("stdout")
@@ -4026,9 +4182,8 @@ def json_turn(world: World, body: dict) -> Iterator[dict]:
     choices fails with the same 'model endpoint returned' wording
     sse_stream uses."""
     provider = provider_of(world)
-    url = (world.get("env").get("WISP_LLM_URL", "").rstrip("/")
-           + path_of(provider))
-    headers = auth_headers_of(world, provider)
+    url = request_url_of(world)
+    headers = auth_headers_of(world)
     http = world.get("http")
     meta = {}
     out = world.get("stdout")

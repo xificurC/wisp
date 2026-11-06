@@ -26,7 +26,9 @@ Put `wisp` on your `PATH`, e.g. `ln -s $PWD/wisp/wisp ~/.local/bin/`.
 
 ``` shell
 # these can go in your .bashrc or project .env
-export WISP_LLM_URL=https://my-llm.endpoint WISP_LLM_API_KEY=sk-apikey WISP_LLM_API=(anthropic | chat | responses)
+export WISP_LLM_URL=https://my-llm.endpoint/v1/chat/completions
+export WISP_LLM_API_KEY=sk-apikey
+export WISP_LLM_API=openai-chat # or openai-responses, or anthropic
 # initialize a session - set model, thinking, system prompt
 export WISP_SESSION_DIR=$(wisp new -m model -t high --env-in-system-prompt -s <(wisp build-system-prompt --skills --agents-md --wisp))
 # run first query
@@ -34,6 +36,8 @@ wisp run <<<"tell me about nonviolent communication" | wisp render-live
 # run followup query (same session, shared via `WISP_SESSION_DIR`)
 wisp run <<<"give me 5 examples how to turn a jackal sentence to a giraffe one" | wisp render-live
 ```
+
+Find your provider setup in [AI_SETUP_RECIPES.md](AI_SETUP_RECIPES.md).
 
 ## Architecture
 
@@ -68,7 +72,9 @@ A wrapper around `wisp` and `tikit`. Added functionality:
 
 ``` shell
 # these can go in your .bashrc or project .env
-export WISP_LLM_URL=https://my-llm.endpoint WISP_LLM_API_KEY=sk-apikey WISP_LLM_API=(anthropic | chat | responses)
+export WISP_LLM_URL=https://my-llm.endpoint/v1/chat/completions
+export WISP_LLM_API_KEY=sk-apikey
+export WISP_LLM_API=openai-chat # or openai-responses, or anthropic
 export WISPY_TICKET=$(tikit create --name "fix 42")
 wispy run <<<"build a plan" | wisp render-live
 wispy run <<<"I approve the plan. Go." | wisp render-live

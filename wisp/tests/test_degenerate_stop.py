@@ -104,11 +104,6 @@ class _Stdin:
         raise AssertionError("loop_rounds reads no stdin")
 
 
-class _Http:
-    def get_json(self, url, headers):
-        raise IOError("no model info in tests")
-
-
 class _Harness:
     """One session dir plus a world wired for loop_rounds."""
 
@@ -128,9 +123,8 @@ class _Harness:
         self.world.set("stderr", io.StringIO())
         self.world.set("stdout", io.StringIO())
         self.world.set("stdin", _Stdin())
-        self.world.set("http", _Http())
         self.world.set("sessiondir", self.sessiondir)
-        self.world.set("env", {"WISP_LLM_URL": "u",
+        self.world.set("env", {"WISP_LLM_URL": "http://u/v1/chat/completions",
                                "WISP_LLM_API_KEY": "k"})
         self.world.set("model", "m")
         self.world.set("thinking", None)

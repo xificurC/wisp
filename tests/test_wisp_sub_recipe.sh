@@ -161,7 +161,7 @@ done
 if [ -z "$port" ]; then
     check "7: recipe runs verbatim; stream law holds" 1
 else
-    export WISP_LLM_URL="http://127.0.0.1:$port"
+    export WISP_LLM_URL="http://127.0.0.1:$port/v1/chat/completions"
     export WISP_LLM_API_KEY=fake-key
     P7="$($WISP new --name parent7 -m test-model)"
     (

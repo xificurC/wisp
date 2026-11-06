@@ -128,7 +128,7 @@ class _Harness:
         self.http = http or _FakeHttp()
         self.world.set("http", self.http)
         self.world.set("sessiondir", self.sessiondir)
-        self.world.set("env", {"WISP_LLM_URL": "http://u",
+        self.world.set("env", {"WISP_LLM_URL": "http://u/v1/chat/completions",
                                "WISP_LLM_API_KEY": "k"})
         self.world.set("model", "m")
         self.world.set("thinking", None)
