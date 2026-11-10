@@ -173,6 +173,7 @@ class FakeExec:
         self.heads = ["aaa", "bbb"]
         self.new_fail = ""
         self.on_stream = None
+        self.on_status = None
 
     # -- helpers
     def _value(self, argv, flag):
@@ -240,6 +241,8 @@ class FakeExec:
             return Result(0, (self.heads.pop(0) if self.heads else "zzz")
                           + "\n")
         if args == ["status", "--porcelain"]:
+            if self.on_status is not None:
+                return Result(0, self.on_status())
             return Result(0, self.status)
         if args[:2] == ["status", "--porcelain"]:
             return Result(0, self.ticket_status)
@@ -894,6 +897,61 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(harness.run("commit"), 0)
         self.assertIn("closed(ai-test): Test ticket",
                       harness.exec.stream_calls()[0][2])
+
+    def test_close_closes_the_ticket_before_the_prompt(self):
+        harness = Harness()
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed")]
+        self.assertEqual(harness.run("commit", "--close"), 0)
+        prompt = harness.exec.stream_calls()[0][2]
+        self.assertIn("Ticket status: closed", prompt)
+        self.assertIn("closed(ai-test): Test ticket", prompt)
+        self.assertIn("status: 'closed'", prompt)
+        self.assertIn("status: 'closed'", harness.fs.files[TPATH])
+        self.assertIn("status wip -> closed", harness.errors())
+
+    def test_close_works_from_an_open_ticket(self):
+        harness = Harness(ticket=OPEN_TICKET)
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed")]
+        self.assertEqual(harness.run("commit", "--close"), 0)
+        self.assertIn("closed(ai-test): Test ticket",
+                      harness.exec.stream_calls()[0][2])
+        self.assertIn("status: 'closed'", harness.fs.files[TPATH])
+        self.assertIn("status open -> closed", harness.errors())
+
+    def test_close_on_a_closed_ticket_is_noted(self):
+        harness = Harness(ticket=CLOSED_TICKET)
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed")]
+        self.assertEqual(harness.run("commit", "--close"), 0)
+        self.assertIn("already closed", harness.errors())
+        self.assertIn("closed(ai-test): Test ticket",
+                      harness.exec.stream_calls()[0][2])
+
+    def test_close_makes_the_ticket_record_so_the_commit_starts(self):
+        harness = Harness()
+        harness.exec.on_status = lambda: (
+            "" if "status: 'closed'" not in harness.fs.files[TPATH]
+            else " M .tickets/ai-test/ticket.md\n")
+        harness.exec.streams = [(0, "sealed")]
+        self.assertEqual(harness.run("commit", "--close"), 0)
+        self.assertEqual(len(harness.exec.stream_calls()), 1)
+        self.assertIn("status: 'closed'", harness.fs.files[TPATH])
+
+    def test_the_close_waits_for_the_phase_gate(self):
+        harness = Harness()
+        session = harness.add_session("001")
+        harness.fs.write_text(TD + "/.phase", "work 001 %s\n" % session)
+        self.assertEqual(harness.run("commit", "--close"), 2)
+        self.assertIn("unfinished run", harness.errors())
+        self.assertIn("status: 'wip'", harness.fs.files[TPATH])
+
+    def test_close_is_refused_outside_a_commit(self):
+        harness = Harness()
+        self.assertEqual(harness.run("run", "--close"), 2)
+        self.assertIn("takes no --close", harness.errors())
+        self.assertIn("status: 'wip'", harness.fs.files[TPATH])
 
     def test_a_commit_marker_is_retried(self):
         harness = Harness()

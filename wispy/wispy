@@ -4,7 +4,7 @@
   wispy run      [--skills LIST] [flags]          < request
   wispy continue [--skills LIST] [flags]         [< request]
   wispy steer                                    < message
-  wispy commit   [--skills LIST] [flags]         [< brief]
+  wispy commit   [--skills LIST] [--close] [flags]  [< brief]
   wispy response
 
 The binding is the environment variable WISPY_TICKET. Its value is a
@@ -36,7 +36,9 @@ must arrive through a pipe.
 commit runs one seal session. It reads an optional one-shot brief on
 stdin, stages the ticket's work, and makes one commit. It runs no
 test, lint, or build. It refuses while .phase holds a run of another
-kind.
+kind. With --close it writes the ticket status to closed before the
+prompt is built, so the subject reads closed(<id>): <name> and the
+ticket record that the commit stages agrees with that subject.
 
 response prints the newest saved work response, selected by number.
 
@@ -53,6 +55,7 @@ Flags:
   --cap L            state line cap (default 100)
   --max-sessions N   sessions this call starts (default 20)
   --skills LIST      run, commit: skill names, comma separated
+  --close            commit: set the ticket status to closed first
 
 Exit codes: 0 done; 1 API error; 2 usage or gate;
 75 the context guard fired at the session cap; 128+n killed; 130 after
@@ -359,6 +362,20 @@ def mark_wip(world: World, ticket: Ticket) -> None:
     was = ticket.status or "(none)"
     set_status(world, ticket, "wip")
     note(world, "ticket %s: status %s -> wip" % (ticket.id, was))
+
+
+def mark_closed(world: World, ticket: Ticket) -> None:
+    """A --close commit closes the ticket before the prompt is built.
+
+    The subject, the prompt header, and the ticket record then say the
+    same thing. The commit session stages the record it reads.
+    """
+    if ticket.status == "closed":
+        note(world, "ticket %s: already closed" % ticket.id)
+        return
+    was = ticket.status or "(none)"
+    set_status(world, ticket, "closed")
+    note(world, "ticket %s: status %s -> closed" % (ticket.id, was))
 
 
 # --- phases ------------------------------------------------------------------
@@ -1077,6 +1094,8 @@ def cmd_commit(world: World, opts: Any) -> int:
         fail(world, 1, "ticket dir %s is outside the git work tree %s"
                        % (ticket.dir, repo))
     steering = read_steering(world)
+    if opts.close:
+        mark_closed(world, ticket)
     if phase is not None:
         clear_phase(world, ticket)
     ensure_ticket_gitignore(world, ticket)
@@ -1157,6 +1176,7 @@ class Opts:
     cap: int = CAP
     max_sessions: int = MAX_SESSIONS
     skills: list = field(default_factory=list)
+    close: bool = False
 
 
 COMMANDS: dict = {
@@ -1179,6 +1199,10 @@ VALUED: dict = {
 
 NUMBERS = ("guard", "cap", "max_sessions")
 
+FLAGS: dict = {
+    "--close": "close",
+}
+
 
 def parse_args(world: World, argv: list) -> Opts | None:
     if not argv:
@@ -1191,6 +1215,9 @@ def parse_args(world: World, argv: list) -> Opts | None:
     rest = argv[1:]
     while rest:
         arg = rest.pop(0)
+        if arg in FLAGS:
+            setattr(opts, FLAGS[arg], True)
+            continue
         if arg in VALUED:
             if not rest:
                 fail(world, 2, "%s needs a value" % arg)
@@ -1222,6 +1249,9 @@ def parse_args(world: World, argv: list) -> Opts | None:
         fail(world, 2, "--guard needs a percent from 1 to 100")
     if opts.skills and opts.command not in ("run", "commit"):
         fail(world, 2, "%s takes no --skills; start a run to set the skill set"
+                       % opts.command)
+    if opts.close and opts.command != "commit":
+        fail(world, 2, "%s takes no --close; close the ticket in a commit"
                        % opts.command)
     return opts
 

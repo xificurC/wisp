@@ -28,12 +28,18 @@ The session is composable. The ticket is the constant.
 wispy run      [--skills LIST] [flags]          < request
 wispy continue [--skills LIST] [flags]         [< request]
 wispy steer                                    < message
-wispy commit   [--skills LIST] [flags]         [< brief]
+wispy commit   [--skills LIST] [--close] [flags]  [< brief]
 wispy response
 ```
 
 `WISPY_TICKET` is the only binding. It holds a path or an id. An empty,
 unset, or unresolved value exits 2 before any model call.
+
+`wispy commit --close` writes `status: 'closed'` into the ticket before
+the commit prompt is built. The subject then reads `closed(<id>): <name>`,
+the prompt header says the same, and the ticket record that the commit
+stages agrees with its subject. Without `--close`, the subject carries
+the status that the ticket holds when the command starts.
 
 ## The two files
 
