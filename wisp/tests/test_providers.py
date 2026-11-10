@@ -132,7 +132,7 @@ class TestBodies(unittest.TestCase):
         self.assertEqual(items[3]["name"], "bash")
         # tool output keyed the same way
         self.assertEqual(items[4]["call_id"], "c1")
-        self.assertEqual(items[4]["output"], "x")
+        self.assertEqual(items[4]["output"], "wisp:tool bash exit=0\nx")
 
     def test_anthropic_body(self):
         world = _World("anthropic", thinking="high").world

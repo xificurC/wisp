@@ -1,0 +1,9 @@
+# wispy: wrapper state, not ticket record
+.phase
+.seq
+skills/
+personas/
+STATE.md
+states/
+responses/
+sessions.txt

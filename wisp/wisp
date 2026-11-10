@@ -35,7 +35,8 @@ lost.
 wisp render-live opens each thinking block with a `[think]` marker line and
 each output block with an `[answer]` marker line, prints each tool-call
 header as `[bash 5s 5kb]` with the command on the next line, and prints
-each tool result behind a 🟢 exit=0 or a 🔴 exit=N dot line.
+each tool result as the same text the model receives: the `wisp:tool`
+status header line followed by the raw output.
 Tools: bash and python3, 5s default timeout, 5kB default output cap,
 spill files under <DIR>/spill/ only when the output overflows the
 cap or the command itself exceeds 64kB, never deleted. load_image
@@ -455,10 +456,6 @@ You have three tools: bash, python3, and load_image.
 Each bash or python3 call takes three arguments: command, timeoutSeconds, maxKilobytes.
 The defaults are 5 seconds and 5 kilobytes.
 A timeout stops the command and returns exit code 124.
-wisp writes output larger than maxKilobytes to <sessiondir>/spill/<random-name>.
-The tool note names that spill path. Spill files are never deleted.
-wisp keeps the first 5 kilobytes of overflow output in the result.
-Read the rest with: tail -c +5001 <spill-path>
 Set maxKilobytes higher when you need more output in one call.
 Set timeoutSeconds higher when you need more time in one call.
 The pattern for slow work: one foreground call with a raised
@@ -467,6 +464,16 @@ The anti-pattern: start the command with nohup or & in one call, then
 poll for its end with sleep loops in later calls. Do not do this.
 Each poll round only waits and adds cost. Keep the command in the
 foreground of one call and raise its timeoutSeconds instead.
+
+Every tool result starts with one line of harness status, then the
+command's output. The line begins "wisp:tool ". That line is not
+output. Fields: name, exit, ms, and, only when they apply, bytes,
+offset, rest_kb, spill, timeout_s, abandoned. exit is the process
+exit code; nonzero is a fact, not a verdict (grep and diff use 1).
+A result with spill="..." was truncated at the returned head. Read the
+rest with: tail -c +<offset> <spill-path>. Set maxKilobytes=rest_kb on
+a new call to read the rest in one piece. Spill files are never deleted.
+The first byte after the status line is the command's first byte.
 
 SESSION DIR
 
@@ -2093,8 +2100,9 @@ def command_help_text(cmd: str) -> str:
             "",
             "Each thinking block opens with a [think] marker line and each",
             "output block with [answer]. Tool-call headers print as",
-            "[bash 5s 5kb] with the command on the next line; tool results",
-            "sit behind a \U0001F7E2 exit=0 or a \U0001F534 exit=N dot line.",
+            "[bash 5s 5kb] with the command on the next line; each tool",
+            "result prints the wisp:tool status header line and the raw",
+            "output, the same text the model receives.",
         ]) + "\n",
         "render-past": "\n".join([
             "wisp render-past: render a past run.",
@@ -2763,7 +2771,8 @@ class Tools:
     injects `data: {"wisp":"tool_call","name":...,"timeoutSeconds":...,
     "maxKilobytes":...,"command":...}` before it runs and
     `data: {"wisp":"tool_result","name":...,"call_id":...,"content":...,
-    "exit":...}` after. Defaults: 5s timeout, 5kB output cap. A command
+    "exit":...,"ms":...}` after, plus the anomaly fields the record
+    carries. Defaults: 5s timeout, 5kB output cap. A command
     at most 64kB runs through the -c argument with its head in memory;
     a bigger command or output beyond the cap goes to
     <sessiondir>/spill/<rand8>, and spill files are never deleted.
@@ -2780,7 +2789,6 @@ class Tools:
         name = call.get("name") or ""
         record = {"type": "tool", "call_id": call.get("id"), "name": name,
                   "content": "", "exit": 0}
-        started = world.get("clock").ms()
         safe_log(world, "tool", "start", "name=%s" % name,
                  "call_id=%s" % record["call_id"])
         try:
@@ -2788,6 +2796,7 @@ class Tools:
         except ValueError:
             args = None
         command = args.get("command") if isinstance(args, dict) else None
+        started = world.get("clock").monotonic()
         if name == "load_image":
             path = args.get("path") if isinstance(args, dict) else None
             self._inject({"wisp": "tool_call", "name": name,
@@ -2810,14 +2819,17 @@ class Tools:
                           "timeoutSeconds": "?", "maxKilobytes": "?",
                           "command": command if isinstance(command, str)
                           else (call.get("arguments") or "")})
+        record["ms"] = max(0, int(round(
+            (world.get("clock").monotonic() - started) * 1000)))
         safe_log(world, "tool", "end", "name=%s" % name,
                  "call_id=%s" % record["call_id"],
                  "exit=%s" % record["exit"],
-                 "ms=%s" % (world.get("clock").ms() - started),
+                 "ms=%s" % record["ms"],
                  "bytes=%s" % len(record["content"]))
         payload = {"wisp": "tool_result", "name": name,
                    "call_id": record["call_id"], "content": record["content"],
                    "exit": record["exit"]}
+        payload.update(tool_status_of(record))
         if record.get("attachments"):
             payload["attachments"] = [
                 {"name": att["name"], "media_type": att["media_type"]}
@@ -2875,7 +2887,11 @@ class Tools:
 
     def _run_tool(self, record: dict, name: str, command: str,
                   seconds: int, maxkb: int) -> None:
-        """Run one command; fill content and exit into the record.
+        """Run one command; fill content, exit, and the status fields.
+
+        The spill branch records `spill`, `bytes`, `offset`, and
+        `rest_kb`; a forced stop records `timeout_s`; an abandoned
+        drain records `abandoned`. The record keeps facts, never prose.
 
         No file is created for a small, quick command: the head stays in
         memory. A spill file appears only when the output overflows the
@@ -2884,45 +2900,18 @@ class Tools:
         rc, head, spill_path, abandoned = self._world.get("exec").run(
             self._argv(name, command), seconds, maxkb * 1000, self._spill)
         record["exit"] = rc
-        content = head.decode("utf-8", "replace")
-        notes = []
+        record["content"] = head.decode("utf-8", "replace")
         if spill_path:
             spill_size = self._world.get("fs").size(spill_path)
             cap_bytes = maxkb * 1000
-            offset = cap_bytes + 1
-            rest_kb = (spill_size - cap_bytes + 999) // 1000
-            if rest_kb > maxkb:
-                # The rest alone exceeds the same cap, so a plain tail read
-                # spills again. Say so, and give the exact maxKilobytes
-                # that makes the same tail read return the full rest in
-                # one clean call. rest_kb is ceil, so maxKilobytes=rest_kb
-                # covers every rest byte: output equal to the cap does not
-                # spill.
-                notes.append(
-                    "Output greater than maxKilobytes=%s. Full output written to: %s. "
-                    "The rest of the spill file is %skb. To read the rest of the "
-                    "output there are 2 options:\n"
-                    "- read the next page with: tail -c +%s %s "
-                    "(Note: this will spill again)\n"
-                    "- set maxKilobytes=%s on the tool call and read with: "
-                    "tail -c +%s %s (Note: this will read the full contents)"
-                    % (maxkb, spill_path, rest_kb, offset, spill_path,
-                       rest_kb, offset, spill_path))
-            else:
-                notes.append(
-                    "Output greater than maxKilobytes=%s. Full output written to: %s. "
-                    "Use tail -c +%s %s to keep reading. The rest of the spill file "
-                    "is %skb. Your tool call allows setting maxKilobytes to adjust "
-                    "the max returned output size."
-                    % (maxkb, spill_path, offset, spill_path, rest_kb))
+            record["spill"] = spill_path
+            record["bytes"] = spill_size
+            record["offset"] = cap_bytes + 1
+            record["rest_kb"] = (spill_size - cap_bytes + 999) // 1000
         if rc == 124:
-            notes.append("Run took longer than timeoutSeconds=%s. Forced exit code 124."
-                         % seconds)
+            record["timeout_s"] = seconds
         if abandoned:
-            notes.append("Output abandoned after the drain grace; the spill file may be partial.")
-        if notes:
-            content += "\n---\nTool call notes:\n" + "\n".join(notes)
-        record["content"] = content
+            record["abandoned"] = True
 
     def _argv(self, name: str, command: str) -> list:
         """[name, -c, command], or a spill-dir command file when the
@@ -3429,6 +3418,45 @@ def data_uri_of(att: dict) -> str:
     openai dialects embed: 'data:<media_type>;base64,<data>'."""
     return "data:%s;base64,%s" % (att["media_type"], att["data"])
 
+TOOL_STATUS_FIELDS = ("ms", "bytes", "offset", "rest_kb", "spill",
+                      "timeout_s", "abandoned")
+"""The tool-result status facts, in header and payload order."""
+
+def tool_status_of(rec: dict) -> dict:
+    """The status facts one tool record carries, in a fixed order.
+
+    Only fields the record has are kept, so an old record with no
+    measured duration replays as `wisp:tool bash exit=1`."""
+    return {key: rec[key] for key in TOOL_STATUS_FIELDS
+            if rec.get(key) is not None}
+
+def tool_text_of(rec: dict) -> str:
+    """The model-facing text of one tool record.
+
+    One status header line, then the raw output. The header is derived
+    from stored fields at wire time, so `content` stays raw in
+    wisp.jsonl. Position authenticates the header: a command cannot
+    print before its own output, so a forged `wisp:tool` line lands
+    after the true one and reads as output."""
+    parts = ["wisp:tool", rec.get("name") or "",
+             "exit=%d" % int(rec.get("exit") or 0)]
+    if rec.get("ms") is not None:
+        parts.append("ms=%d" % int(rec["ms"]))
+    if rec.get("spill"):
+        parts += ["bytes=%d" % int(rec.get("bytes") or 0),
+                  "offset=%d" % int(rec.get("offset") or 0),
+                  "rest_kb=%d" % int(rec.get("rest_kb") or 0),
+                  "spill=%s" % json.dumps(rec["spill"])]
+    if rec.get("timeout_s") is not None:
+        parts.append("timeout_s=%s" % rec["timeout_s"])
+    if rec.get("abandoned"):
+        parts.append("abandoned=1")
+    content = rec.get("content") or ""
+    if not content and not rec.get("spill"):
+        parts.append("bytes=0")
+    line = " ".join(parts)
+    return line + "\n" + content if content else line
+
 def message_of(rec: dict) -> dict:
     """Map one stored record to its wire message.
 
@@ -3453,11 +3481,8 @@ def message_of(rec: dict) -> dict:
             msg["tool_calls"] = calls
         return msg
     if kind == "tool":
-        content = rec["content"]
-        if rec.get("attachments"):
-            content = content or "(see attached image)"
         return {"role": "tool", "tool_call_id": rec["call_id"],
-                "content": content}
+                "content": tool_text_of(rec)}
     if kind == "user" and rec.get("attachments"):
         parts = [{"type": "text", "text": rec["content"]}]
         for att in rec["attachments"]:
@@ -3510,16 +3535,16 @@ def items_of_responses(rec: dict) -> list:
                             "name": b["name"], "arguments": b["arguments"]})
         return out
     if kind == "tool":
+        text = tool_text_of(rec)
         if rec.get("attachments"):
-            parts = [{"type": "input_text",
-                      "text": rec["content"] or "(see attached image)"}]
+            parts = [{"type": "input_text", "text": text}]
             for att in rec["attachments"]:
                 parts.append({"type": "input_image",
                               "image_url": data_uri_of(att)})
             return [{"type": "function_call_output",
                      "call_id": rec["call_id"], "output": parts}]
         return [{"type": "function_call_output", "call_id": rec["call_id"],
-                 "output": rec["content"]}]
+                 "output": text}]
     return []
 
 
@@ -3569,9 +3594,9 @@ def items_of_anthropic(rec: dict) -> list:
             return []
         return [{"role": "assistant", "content": content}]
     if kind == "tool":
+        text = tool_text_of(rec)
         if rec.get("attachments"):
-            content = [{"type": "text",
-                        "text": rec["content"] or "(see attached image)"}]
+            content = [{"type": "text", "text": text}]
             for att in rec["attachments"]:
                 content.append({"type": "image", "source": {
                     "type": "base64", "media_type": att["media_type"],
@@ -3581,7 +3606,7 @@ def items_of_anthropic(rec: dict) -> list:
                  "content": content}]}]
         return [{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": rec["call_id"],
-             "content": rec["content"]}]}]
+             "content": text}]}]
     return []
 
 
@@ -4431,10 +4456,11 @@ class Renderer:
     """Renders the run stdout stream (raw SSE plus injected tool records)
     to plain text: a `[think]` marker line opens each thinking block, an
     `[answer]` marker line opens each output block, each tool-call header
-    stands alone with the command below it, and a 🟢/🔴 exit dot line
-    precedes each tool result, no colors. render-past replays committed
-    system and user records through the prompt() path     `[system]`
-    or `[user]` marker line; the live stream never carries one. A
+    tag line carries the command in a code fence below it, and each tool result prints
+    the exact text the model receives, no colors. render-past replays
+    committed system and user records through the prompt() path as a
+    `[system]` or `[user]` marker line; the live stream never carries
+    one. A
     steered user record replays through the steer() path as a `[steer]`
     marker line, the same shape the live drain injected."""
 
@@ -4499,8 +4525,10 @@ class Renderer:
             self._emit(ANSWER_LABEL, content)
 
     def tool_header(self, payload: dict) -> None:
-        """The [name 5s 5kb] command pretty print; a call with broken
-        arguments shows ?s ?kB and the raw argument text."""
+        """The [name 5s 5kb] tag line, then the command fenced in a
+        triple-backtick block so it cannot join the tag line or the
+        agent block below; a call with broken arguments shows ?s ?kB
+        and the raw argument text."""
         name = payload.get("name", "tool")
         seconds = payload.get("timeoutSeconds", DEFAULT_TOOL_TIMEOUT)
         maxkb = payload.get("maxKilobytes", DEFAULT_TOOL_MAXKB)
@@ -4511,18 +4539,15 @@ class Renderer:
         else:
             self._out.write("[%s %ss %skb]\n" % (name, seconds, maxkb))
         if command:
-            self._out.write(command + "\n")
+            self._out.write("```\n%s\n```\n" % command)
         self._open_line = False
 
     def tool_result(self, payload: dict) -> None:
-        exit_code = payload.get("exit", 0)
-        dot = "🟢" if exit_code == 0 else "🔴"
-        self._out.write("%s %s\n" % (dot, exit_code))
-        content = payload.get("content", "")
-        self._out.write(content if content.endswith("\n") else content + "\n")
-        for att in payload.get("attachments") or []:
-            self._out.write("[attachment: %s, %s]\n"
-                            % (att.get("name", ""), att.get("media_type", "")))
+        """Print the tool text the model receives: the `wisp:tool` status
+        header line and the raw output below it. One rendering path, so a
+        human reads the agent's view without a translation step."""
+        text = tool_text_of(payload)
+        self._out.write(text if text.endswith("\n") else text + "\n")
         # A tool result may leave a color or other SGR state active at its
         # end (the command never reset it, or the output cap cut off its
         # reset).  Close that state so it cannot bleed into later render
@@ -4600,6 +4625,7 @@ def records_to_stream(records: list) -> Iterator[str]:
             payload = {"wisp": "tool_result", "name": rec.get("name", ""),
                        "call_id": call_id, "content": rec.get("content", ""),
                        "exit": rec.get("exit", 0)}
+            payload.update(tool_status_of(rec))
             if rec.get("attachments"):
                 payload["attachments"] = [
                     {"name": att.get("name", ""),
