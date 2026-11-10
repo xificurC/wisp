@@ -1,3 +1,7 @@
+<git-commit-rules>
+Never leak the used LLM. This includes the API key, the URL, the model alias. Use broader terms like "company LiteLLM server", and generic model names like "DeepSeek V4.1 Flash".
+</git-commit-rules>
+
 <assistant-final-answer-definition>
 Rules for your final answer:
 
