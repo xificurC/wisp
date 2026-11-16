@@ -11,7 +11,8 @@
   wisp skill read SKILL
   wisp agents-md ls
   wisp agents-md read-all
-  wisp build-system-prompt [--skills] [--agents-md] [--wisp] < extra
+  wisp build-system-prompt [--skills] [--agents-md] [--wisp]
+                           [--wisp-subagents] < extra
   wisp render-live
   wisp render-past [-d DIR]
   wisp usage [-d DIR]
@@ -443,13 +444,14 @@ These are the available skills. When the user request fits a skill's
 description, read the skill file first and follow it."""
 
 
-def wisp_block() -> str:
-    """The wisp block: harness contract, session dir file map, turn model,
-    subagents recipe. Built fresh on each call. <sessiondir> stays
-    literal; build-system-prompt learns no session dir, the reader
-    maps it to the SESSION DIR line of the ENVIRONMENT block that
-    wisp new writes at creation time."""
-    return """\
+def wisp_block(include_subagents: bool = False) -> str:
+    """The wisp block: harness contract, session dir file map, turn model.
+    The SUBAGENTS section joins the block only when the caller asks
+    for it with include_subagents. Built fresh on each call.
+    <sessiondir> stays literal; build-system-prompt learns no session
+    dir, the reader maps it to the SESSION DIR line of the ENVIRONMENT
+    block that wisp new writes at creation time."""
+    text = """\
 HARNESS
 
 You have three tools: bash, python3, and load_image.
@@ -519,7 +521,10 @@ decide.
 load_image takes a path and an optional resize flag. The default
 resize true fits the image into the default dimension and byte
 limits. resize false sends the file bytes unchanged.
-""" + "\n\n" + subagents_block()
+"""
+    if include_subagents:
+        return text + "\n\n" + subagents_block()
+    return text.rstrip("\n")
 
 
 def subagents_block() -> str:
@@ -533,7 +538,7 @@ SUBAGENTS
 
 This block carries the subagent laws. A session with no SUBAGENTS
 block in its system prompt must not start children. It must ask
-the operator to rebuild its prompt with --wisp.
+the operator to rebuild its prompt with --wisp-subagents.
 
 LAWS
 
@@ -655,10 +660,12 @@ def build_system_prompt(world: World, opts: Any) -> int:
     """Concatenate the wisp block, AGENTS.md files, skill summaries,
     and stdin."""
     if not (opts.wisp or opts.agents_md or opts.skills):
-        fail(world, "wisp build-system-prompt: pass --agents-md or --skills")
+        fail(world, "wisp build-system-prompt: pass --wisp, --agents-md"
+                    " or --skills")
     blocks = []
     if opts.wisp:
-        blocks.append(xml_block("wisp", None, wisp_block()))
+        blocks.append(xml_block("wisp", None,
+                                wisp_block(opts.wisp_subagents)))
     if opts.agents_md:
         blocks.extend(
             xml_block("agents-md", p, world.get("fs").read_text(p))
@@ -1768,6 +1775,7 @@ class Opts:
         self.skills = False  # build-system-prompt --skills
         self.agents_md = False # build-system-prompt --agents-md
         self.wisp = False    # build-system-prompt --wisp
+        self.wisp_subagents = False  # build-system-prompt --wisp-subagents
         self.env_in_system_prompt = False  # new --env-in-system-prompt
         self.search_global = False  # ls/grep --global
         self.tree = False           # ls/grep --tree
@@ -1897,6 +1905,8 @@ def parse_args(world: World, argv: list[str]) -> Any:
             opts.agents_md = True
         elif arg == "--wisp":
             opts.wisp = True
+        elif arg == "--wisp-subagents":
+            opts.wisp_subagents = True
         elif arg == "--env-in-system-prompt":
             opts.env_in_system_prompt = True
         elif arg == "--attach":
@@ -1913,6 +1923,10 @@ def parse_args(world: World, argv: list[str]) -> Any:
             fail(world, "wisp new: -m MODEL is required")
         if opts.sysfile and not world.get("fs").exists(opts.sysfile):
             fail(world, "system file not found: %s" % opts.sysfile)
+    # The subagent block is a section of the wisp block: opting into
+    # subagents opts into the block that carries them.
+    if opts.wisp_subagents:
+        opts.wisp = True
     if opts.context_guard is not None:
         if opts.command not in ("run", "continue"):
             fail(world, "wisp %s: --context-guard is a flag of"
@@ -2090,13 +2104,19 @@ def command_help_text(cmd: str) -> str:
         "build-system-prompt": "\n".join([
             "wisp build-system-prompt: assemble a system prompt to stdout.",
             "",
-            "  wisp build-system-prompt [--skills] [--agents-md] [--wisp] < extra",
+            "  wisp build-system-prompt [--skills] [--agents-md] [--wisp]",
+            "                          [--wisp-subagents] < extra",
             "",
-            "--wisp  print the wisp block: harness, session dir map, turn model",
-            "Concatenates the wisp block (--wisp), AGENTS.md files",
-            "(--agents-md) and skill summaries (--skills) with the text on",
-            "stdin, each wrapped in its own XML block with a closing tag.",
-            "At least one of --wisp, --skills and --agents-md is required;",
+            "--wisp            print the wisp block: harness, session dir",
+            "                  map, turn model",
+            "--wisp-subagents  add the SUBAGENTS section: the child-session",
+            "                  laws and recipes; implies --wisp",
+            "Concatenates the wisp block (--wisp), its SUBAGENTS section",
+            "(--wisp-subagents), AGENTS.md files (--agents-md) and skill",
+            "summaries (--skills) with the text on stdin, each wrapped in",
+            "its own XML block with a closing tag.",
+            "At least one of --wisp, --wisp-subagents, --skills and",
+            "--agents-md is required;",
             "a non-tty stdin is always appended.",
             "The AGENTS.md chain total order is ascending priority: the",
             "user file first, the CWD file last. AGENTS.local.md files",

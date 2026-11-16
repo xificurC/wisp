@@ -31,7 +31,8 @@ LAWS = [
     "This block carries the subagent laws.",
     "A session with no SUBAGENTS block in its system prompt must not"
     " start children.",
-    "It must ask the operator to rebuild its prompt with --wisp.",
+    "It must ask the operator to rebuild its prompt with"
+    " --wisp-subagents.",
     "The parent law: give every child --parent with your session dir.",
     "A child without --parent is an orphan.",
     '"wisp ls --tree" and "wisp grep --tree" cannot see an orphan.',
@@ -96,6 +97,10 @@ class SubagentLawsTest(unittest.TestCase):
         self.assertIn("wisp ls --tree and wisp grep --tree cannot see"
                       " an orphan", flat)
 
+    def test_wisp_block_omits_subagents_by_default(self):
+        self.assertNotIn("SUBAGENTS", wisp.wisp_block())
+        self.assertIn("SUBAGENTS", wisp.wisp_block(include_subagents=True))
+
     def test_docstring_mandate(self):
         flat = _flat(wisp.__doc__)
         self.assertIn("[--parent DIR] # child sessions: give it"
@@ -104,6 +109,30 @@ class SubagentLawsTest(unittest.TestCase):
         self.assertIn("`wisp ls --tree` and `wisp grep --tree` cannot"
                       " see an orphan.", flat)
         self.assertNotIn("[--parent DIR])", wisp.__doc__)
+
+
+class BuildSystemPromptSubagentsTest(unittest.TestCase):
+    """--wisp-subagents adds the SUBAGENTS section; --wisp alone omits it."""
+
+    def _build(self, *flags):
+        return subprocess.run(
+            [os.path.join(REPO, "wisp"), "build-system-prompt", *flags],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True)
+
+    def test_wisp_alone_omits_subagents(self):
+        run = self._build("--wisp")
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertIn("<wisp>", run.stdout)
+        self.assertIn("HARNESS", run.stdout)
+        self.assertNotIn("SUBAGENTS", run.stdout)
+
+    def test_flag_adds_subagents_and_implies_wisp(self):
+        run = self._build("--wisp-subagents")
+        self.assertEqual(0, run.returncode, run.stderr)
+        self.assertIn("HARNESS", run.stdout)
+        self.assertIn("\nSUBAGENTS\n", run.stdout)
+        self.assertIn("The invariants:", run.stdout)
+        self.assertIn("</wisp>", run.stdout)
 
 
 class TopLevelNewTest(unittest.TestCase):

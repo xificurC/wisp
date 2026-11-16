@@ -192,9 +192,9 @@ fi
 kill "$SERVER_PID" 2>/dev/null
 SERVER_PID=""
 
-# --- case 8: the wisp block teaches the recipe ---------------------------
+# --- case 8: the subagents block teaches the recipe ---------------------
 
-$WISP build-system-prompt --wisp < /dev/null > "$TESTDIR/block8.txt" 2>/dev/null
+$WISP build-system-prompt --wisp-subagents < /dev/null > "$TESTDIR/block8.txt" 2>/dev/null
 if grep -q "^SUBAGENTS$" "$TESTDIR/block8.txt" \
    && grep -qF 'wisp run -d "$CHILD" --context-guard 70% > "$CHILD/wisp.stream"' "$TESTDIR/block8.txt" \
    && grep -qF 'tail -f "$CHILD/wisp.stream" | wisp render-live' "$TESTDIR/block8.txt" \
@@ -209,9 +209,18 @@ if grep -q "^SUBAGENTS$" "$TESTDIR/block8.txt" \
    && grep -qF -- "--env-in-system-prompt" "$TESTDIR/block8.txt" \
    && grep -qF -- "--context-guard 70%" "$TESTDIR/block8.txt" \
    && grep -qF -- "--skills --agents-md" "$TESTDIR/block8.txt"; then
-    check "8: wisp block teaches the recipe" 0
+    check "8: subagents block teaches the recipe" 0
 else
-    check "8: wisp block teaches the recipe" 1
+    check "8: subagents block teaches the recipe" 1
+fi
+
+# --- case 9: --wisp alone omits the subagents block ---------------------
+
+$WISP build-system-prompt --wisp < /dev/null > "$TESTDIR/block9.txt" 2>/dev/null
+if grep -q "^SUBAGENTS$" "$TESTDIR/block9.txt"; then
+    check "9: --wisp alone omits the subagents block" 1
+else
+    check "9: --wisp alone omits the subagents block" 0
 fi
 
 echo "----------------------------------------"

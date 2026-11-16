@@ -44,8 +44,8 @@ response prints the newest saved work response, selected by number.
 
 --skills LIST is a comma-separated list of skill names. Each name is
 read with `wisp skill read`. The persona holds the wisp block, the
-AGENTS.md chain, the skill catalog, one ticket pointer block, and the
-body of each named skill. A name with no body exits 2. A resume takes
+subagents section, the AGENTS.md chain, the skill catalog, one ticket
+pointer block, and the body of each named skill. A name with no body exits 2. A resume takes
 no --skills: wisp fixes the system prompt at `wisp new`.
 
 Flags:
@@ -589,8 +589,8 @@ class PromptService:
         world = self._world
         fs = world.get("fs")
         base = world.get("exec").output(
-            ["wisp", "build-system-prompt", "--wisp", "--agents-md",
-             "--skills"], stdin_text="")
+            ["wisp", "build-system-prompt", "--wisp", "--wisp-subagents",
+             "--agents-md", "--skills"], stdin_text="")
         if base.rc != 0:
             fail(world, 1, "wisp build-system-prompt exited %d" % base.rc)
         parts = [base.out.rstrip("\n")]

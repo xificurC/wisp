@@ -76,9 +76,14 @@ model needs the base dir to resolve `scripts/run.sh`.
 | Order | Block | Flag |
 |---|---|---|
 | 1 | The wisp block | `--wisp` |
-| 2 | Every `AGENTS.md` in the chain | `--agents-md` |
-| 3 | The skill catalog: one line per skill | `--skills` |
-| 4 | Stdin, wrapped as one block | always, when stdin is not a tty |
+| 2 | The SUBAGENTS section of the wisp block | `--wisp-subagents` |
+| 3 | Every `AGENTS.md` in the chain | `--agents-md` |
+| 4 | The skill catalog: one line per skill | `--skills` |
+| 5 | Stdin, wrapped as one block | always, when stdin is not a tty |
+
+The SUBAGENTS section is opt-in. `--wisp-subagents` implies `--wisp`
+and appends the section inside the same `<wisp>` block, after the
+turn-model text.
 
 The order is not arbitrary. Later text carries more weight in most
 models. The deepest, most local instruction sits last, and the stdin
