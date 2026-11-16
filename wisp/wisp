@@ -453,7 +453,12 @@ def wisp_block() -> str:
 HARNESS
 
 You have three tools: bash, python3, and load_image.
-Each bash or python3 call takes three arguments: command, timeoutSeconds, maxKilobytes.
+A bash or python3 call takes three arguments: command, timeoutSeconds,
+maxKilobytes. command means different things: bash runs it as a shell
+script, normally `bash -c <command>`; python3 runs it as Python
+source, normally `python3 -c <command>`, never as a shell string. Put
+pipes, heredocs, and `cd ... && ...` lines in a bash call. Shell
+syntax sent as python3 source fails with a bare SyntaxError.
 The defaults are 5 seconds and 5 kilobytes.
 A timeout stops the command and returns exit code 124.
 Set maxKilobytes higher when you need more output in one call.
@@ -478,7 +483,12 @@ The first byte after the status line is the command's first byte.
 SESSION DIR
 
 The session dir is the directory of this one wisp session. It is
-not the current directory. Your tool commands start in the project directory.
+not the current directory. Every bash and python3 call runs a fresh
+process in wisp's working directory, normally the project directory.
+No shell variable, alias, or working directory survives from one call
+to the next: a `cd` in one call is gone in the next. Keep a directory
+change inside the call that needs it: `cd <subdir> && <command>`, or
+name paths from the project directory.
 The session dir holds: wisp.jsonl, spill/, wisp.log, wisp.usage,
 wisp.modelcfg, wisp.run.json, and wisp.stream when a caller
 redirected the run stream there.
@@ -3259,9 +3269,9 @@ TOOLS_SPEC = [
         }, "required": ["command"]}}},
     {"type": "function", "function": {
         "name": "python3",
-        "description": "Run a python3 command and return its output.",
+        "description": "Run Python source and return its output. command is Python code, not a shell string.",
         "parameters": {"type": "object", "properties": {
-            "command": {"type": "string", "description": "The python3 command to run. It is Python code, not a shell string."},
+            "command": {"type": "string", "description": "The Python source to run. It is executed as Python, not by a shell."},
             "maxKilobytes": {"type": "number", "description": "Maximum output size in kilobytes. Default 5."},
             "timeoutSeconds": {"type": "number", "description": "Command timeout in seconds. Default 5."},
         }, "required": ["command"]}}},
