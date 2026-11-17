@@ -37,8 +37,13 @@ commit runs one seal session. It reads an optional one-shot brief on
 stdin, stages the ticket's work, and makes one commit. It runs no
 test, lint, or build. It refuses while .phase holds a run of another
 kind. With --close it writes the ticket status to closed before the
-prompt is built, so the subject reads closed(<id>): <name> and the
-ticket record that the commit stages agrees with that subject.
+prompt is built. The session rewrites the ticket name as a definition
+of the work done and builds the subject <status>(<id>): <name> from
+that name, so the record and the subject agree. wispy then reads the
+committed name and the subject: a name that asks a question, a name
+that runs past 12 words, or a subject that carries another name gets
+one repair turn in the same session, and a failure that survives the
+repair turn stands.
 
 response prints the newest saved work response, selected by number.
 
@@ -558,6 +563,33 @@ def commit_subject(ticket: Ticket) -> str:
                            ticket.name or "<name>")
 
 
+NAME_LEAD = re.compile(
+    r"(?i)^(can|should|shall|does|do|is|are|was|were|how|why|what|when|"
+    r"where|which|who|whom|whose|will|would|could|did|has|have|had)\b")
+NAME_WORDS = 12
+
+
+def name_problem(name: str) -> str:
+    """Why a ticket name fails the definition rule. Empty when it holds.
+
+    The name states the work done. It asks no question, so the commit
+    log reads as a list of definitions, not a list of requests.
+    """
+    text = " ".join(name.split())
+    if not text:
+        return "the name is empty"
+    if text.endswith("?") or NAME_LEAD.match(text):
+        return "the name asks a question: %r" % text
+    if len(text.split()) > NAME_WORDS:
+        return "the name runs past %d words: %r" % (NAME_WORDS, text)
+    return ""
+
+
+def ticket_meta(world: World, ticket: Ticket) -> dict:
+    """The frontmatter as the ticket file holds it now, not as first read."""
+    return parse_frontmatter(world.get("fs").read_text(ticket.path))
+
+
 def ticket_pointer(ticket: Ticket) -> str:
     return '<ticket id="%s" path="%s" file="%s">' % (
         ticket.id, ticket.dir, ticket.path)
@@ -629,11 +661,16 @@ class PromptService:
         rules = read_rule(world, "commit-rules.md")
         head = [
             "Ticket id: %s" % ticket.id,
-            "Ticket name: %s" % (ticket.name or "(none)"),
+            "Ticket name now: %s" % (ticket.name or "(none)"),
             "Ticket status: %s" % (ticket.status or "(none)"),
             "",
             "The commit subject is",
-            "  %s" % commit_subject(ticket),
+            "  <status>(<id>): <name>",
+            "",
+            "The id and the status are the two values above. The name is",
+            "the one you write under `## The name` below, read back from",
+            "the ticket after you write it.",
+            "",
         ]
         parts = [ticket_block(world, ticket), state_block(world, ticket),
                  "\n".join(head)]
@@ -641,6 +678,47 @@ class PromptService:
             parts.append("\n".join(["<steering>", steering.rstrip(),
                                     "</steering>"]))
         parts.append(rules.rstrip("\n"))
+        return "\n".join(parts) + "\n"
+
+    def commit_repair_turn(self, ticket: Ticket, problem: str) -> str:
+        """The one repair turn after the seal gate fails.
+
+        The turn continues the seal session, so the persona already holds
+        the rules. The turn repeats them, and the gate block overrides
+        `## Decide`: amend HEAD, make no new commit.
+        """
+        world = self._world
+        meta = ticket_meta(world, ticket)
+        head = [
+            "Ticket id: %s" % ticket.id,
+            "Ticket name now: %s" % (meta.get("name", "") or "(none)"),
+            "Ticket status: %s" % (meta.get("status", "") or "(none)"),
+            "",
+            "The commit subject is",
+            "  <status>(<id>): <name>",
+            "",
+        ]
+        gate = [
+            "<seal-gate>",
+            "The commit stands. This is the repair turn: make no new",
+            "commit, and amend HEAD instead. Everything below holds,",
+            "with that one change.",
+            "",
+            "Fix the ticket so the check holds: write the `name:` line",
+            "as a definition of the work done, stage the ticket record,",
+            "and amend before this turn ends:",
+            "",
+            '    git commit --amend -m "<status>(<id>): <name>"',
+            "",
+            "Leave no uncommitted record in the ticket dir. Run no check.",
+            "Do not push.",
+            "",
+            problem,
+            "</seal-gate>",
+        ]
+        rules = read_rule(world, "commit-rules.md")
+        parts = [ticket_block(world, ticket), state_block(world, ticket),
+                 "\n".join(head), "\n".join(gate), rules.rstrip("\n")]
         return "\n".join(parts) + "\n"
 
 
@@ -1081,6 +1159,31 @@ def record_lines(status_text: str, repo: str, ticket: Ticket,
     return out
 
 
+def seal_problem(world: World, ticket: Ticket, repo: str) -> str:
+    """Why the sealed commit fails the name rule. Empty when it holds.
+
+    The check reads the committed record: the name in the ticket file,
+    and the subject of HEAD.
+    """
+    meta = ticket_meta(world, ticket)
+    problem = name_problem(meta.get("name", ""))
+    if problem:
+        return ("the committed ticket name fails the definition rule: %s"
+                % problem)
+    subject = git_output(world, ["git", "log", "-1", "--format=%s"], repo)
+    if subject.rc != 0:
+        fail(world, 1, "git log exited %d" % subject.rc)
+    named = Ticket(id=ticket.id, name=meta.get("name", ""),
+                   status=meta.get("status", ticket.status),
+                   path=ticket.path, dir=ticket.dir, text="")
+    expected = commit_subject(named)
+    if subject.out.strip() != expected:
+        return ("the commit subject does not carry the ticket name:"
+                " subject %r, ticket %r"
+                % (subject.out.strip(), expected))
+    return ""
+
+
 def cmd_commit(world: World, opts: Any) -> int:
     ticket = world.get("ticket").open()
     phase = read_phase(world, ticket)
@@ -1143,6 +1246,22 @@ def cmd_commit(world: World, opts: Any) -> int:
         world.get("stderr").write("\n".join(dirty) + "\n")
         note(world, "repair: wispy commit retries in a fresh session")
         return 1
+    problem = seal_problem(world, ticket, repo)
+    if problem:
+        note(world, problem)
+        note(world, "seal repair: one turn in session %s" % session)
+        repair = world.get("session").run(
+            session,
+            world.get("prompt").commit_repair_turn(ticket, problem),
+            opts.guard)
+        if repair != 0:
+            note(world, "the seal repair turn exited %d" % repair)
+        problem = seal_problem(world, ticket, repo)
+        if problem:
+            note(world, "the seal still fails; the commit stands anyway:"
+                        " %s" % problem)
+        else:
+            note(world, "the seal holds after the repair turn")
     clear_phase(world, ticket)
     shown = git_output(world, ["git", "show", "--stat", "HEAD"], repo)
     world.get("stderr").write(shown.out)

@@ -172,6 +172,7 @@ class FakeExec:
         self.ticket_status = ""
         self.heads = ["aaa", "bbb"]
         self.new_fail = ""
+        self.log_subject = None
         self.on_stream = None
         self.on_status = None
 
@@ -246,6 +247,13 @@ class FakeExec:
             return Result(0, self.status)
         if args[:2] == ["status", "--porcelain"]:
             return Result(0, self.ticket_status)
+        if args[:3] == ["log", "-1", "--format=%s"]:
+            if self.log_subject is not None:
+                return Result(0, self.log_subject + "\n")
+            meta = MOD.parse_frontmatter(self.fs.files.get(TPATH, ""))
+            return Result(0, "%s(%s): %s\n" % (
+                meta.get("status", ""), meta.get("id", ""),
+                meta.get("name", "")))
         if args[:2] == ["show", "--stat"]:
             return Result(0, " stat line\n")
         return Result(1, "", "bad git call")
@@ -263,8 +271,15 @@ class FakeExec:
                 {"type": "assistant",
                  "content": [{"type": "text", "text": reply}]}) + "\n")
         if self.on_stream is not None:
-            hook, self.on_stream = self.on_stream, None
-            hook()
+            pending = self.on_stream
+            if isinstance(pending, list):
+                hook = pending.pop(0) if pending else None
+                if not pending:
+                    self.on_stream = None
+            else:
+                hook, self.on_stream = pending, None
+            if hook is not None:
+                hook()
         return Result(rc)
 
     # -- queries used by the tests
@@ -860,10 +875,99 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(harness.run("commit"), 0)
         calls = harness.exec.stream_calls()
         self.assertEqual(len(calls), 1)
-        self.assertIn("wip(ai-test): Test ticket", calls[0][2])
+        self.assertIn("Ticket name now: Test ticket", calls[0][2])
+        self.assertIn("<status>(<id>): <name>", calls[0][2])
         self.assertEqual(harness.phase(), "")
         self.assertIn("/s/ai-test-c01\n",
                       harness.fs.files[TD + "/sessions.txt"])
+
+    def test_the_commit_prompt_carries_the_name_rule(self):
+        harness = Harness()
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed")]
+        self.assertEqual(harness.run("commit"), 0)
+        prompt = harness.exec.stream_calls()[0][2]
+        self.assertIn("## The name", prompt)
+        self.assertIn("can wisp render-live stream tool calls?", prompt)
+        self.assertIn("wisp render-live: stream tool calls and their"
+                      " results", prompt)
+
+    def test_a_renamed_ticket_holds_the_name_gate(self):
+        harness = Harness()
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed")]
+
+        def rename():
+            harness.fs.write_text(TPATH, TICKET.replace(
+                "name: 'Test ticket'",
+                "name: 'wispy commit: name the ticket in the subject'"))
+
+        harness.exec.on_stream = rename
+        self.assertEqual(harness.run("commit"), 0)
+        self.assertIn("wispy commit: name the ticket in the subject",
+                      harness.fs.files[TPATH])
+        self.assertEqual(len(harness.exec.stream_calls()), 1)
+
+    def test_a_question_name_opens_one_repair_turn(self):
+        harness = Harness()
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed"), (0, "amended")]
+        harness.exec.on_stream = [
+            lambda: harness.fs.write_text(
+                TPATH, TICKET.replace("Test ticket",
+                                      "can wispy name the ticket?")),
+            lambda: harness.fs.write_text(
+                TPATH, TICKET.replace(
+                    "Test ticket",
+                    "wispy commit: name the ticket in the subject")),
+        ]
+        self.assertEqual(harness.run("commit"), 0)
+        calls = harness.exec.stream_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("<seal-gate>", calls[1][2])
+        self.assertIn("asks a question", calls[1][2])
+        self.assertIn("git commit --amend", calls[1][2])
+        self.assertIn("Ticket name now: can wispy name the ticket?",
+                      calls[1][2])
+        self.assertIn("the seal holds after the repair turn",
+                      harness.errors())
+        self.assertNotIn("stands anyway", harness.errors())
+
+    def test_a_name_that_fails_twice_stands_accepted(self):
+        harness = Harness()
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed"), (0, "still bad")]
+        harness.exec.on_stream = lambda: harness.fs.write_text(
+            TPATH, TICKET.replace("Test ticket",
+                                  "can wispy name the ticket?"))
+        self.assertEqual(harness.run("commit"), 0)
+        self.assertEqual(len(harness.exec.stream_calls()), 2)
+        self.assertIn("the commit stands anyway", harness.errors())
+        self.assertIn("asks a question", harness.errors())
+        self.assertEqual(harness.phase(), "")
+
+    def test_a_long_name_opens_the_repair_turn(self):
+        harness = Harness()
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed"), (0, "amended")]
+        long_name = " ".join(["word"] * 13)
+        harness.exec.on_stream = lambda: harness.fs.write_text(
+            TPATH, TICKET.replace("Test ticket", long_name))
+        self.assertEqual(harness.run("commit"), 0)
+        calls = harness.exec.stream_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("12 words", calls[1][2])
+
+    def test_a_subject_that_carries_another_name_opens_the_repair_turn(self):
+        harness = Harness()
+        harness.exec.status = " M wispy/wispy\n"
+        harness.exec.streams = [(0, "sealed"), (0, "amended")]
+        harness.exec.log_subject = "wip(ai-test): Another ticket"
+        self.assertEqual(harness.run("commit"), 0)
+        calls = harness.exec.stream_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("does not carry the ticket name", calls[1][2])
+        self.assertIn("stands anyway", harness.errors())
 
     def test_the_run_rules_stay_out_of_the_commit_persona(self):
         harness = Harness()
@@ -895,8 +999,9 @@ class CommitTests(unittest.TestCase):
         harness.exec.status = " M wispy/wispy\n"
         harness.exec.streams = [(0, "sealed")]
         self.assertEqual(harness.run("commit"), 0)
-        self.assertIn("closed(ai-test): Test ticket",
-                      harness.exec.stream_calls()[0][2])
+        prompt = harness.exec.stream_calls()[0][2]
+        self.assertIn("Ticket status: closed", prompt)
+        self.assertIn("<status>(<id>): <name>", prompt)
 
     def test_close_closes_the_ticket_before_the_prompt(self):
         harness = Harness()
@@ -905,7 +1010,7 @@ class CommitTests(unittest.TestCase):
         self.assertEqual(harness.run("commit", "--close"), 0)
         prompt = harness.exec.stream_calls()[0][2]
         self.assertIn("Ticket status: closed", prompt)
-        self.assertIn("closed(ai-test): Test ticket", prompt)
+        self.assertIn("<status>(<id>): <name>", prompt)
         self.assertIn("status: 'closed'", prompt)
         self.assertIn("status: 'closed'", harness.fs.files[TPATH])
         self.assertIn("status wip -> closed", harness.errors())
@@ -915,7 +1020,7 @@ class CommitTests(unittest.TestCase):
         harness.exec.status = " M wispy/wispy\n"
         harness.exec.streams = [(0, "sealed")]
         self.assertEqual(harness.run("commit", "--close"), 0)
-        self.assertIn("closed(ai-test): Test ticket",
+        self.assertIn("Ticket status: closed",
                       harness.exec.stream_calls()[0][2])
         self.assertIn("status: 'closed'", harness.fs.files[TPATH])
         self.assertIn("status open -> closed", harness.errors())
@@ -926,7 +1031,7 @@ class CommitTests(unittest.TestCase):
         harness.exec.streams = [(0, "sealed")]
         self.assertEqual(harness.run("commit", "--close"), 0)
         self.assertIn("already closed", harness.errors())
-        self.assertIn("closed(ai-test): Test ticket",
+        self.assertIn("Ticket status: closed",
                       harness.exec.stream_calls()[0][2])
 
     def test_close_makes_the_ticket_record_so_the_commit_starts(self):
@@ -960,6 +1065,37 @@ class CommitTests(unittest.TestCase):
         harness.exec.status = ""
         self.assertEqual(harness.run("commit"), 0)
         self.assertEqual(harness.phase(), "")
+
+
+class NameProblemTests(unittest.TestCase):
+    def test_a_definition_holds(self):
+        self.assertEqual(MOD.name_problem(
+            "wisp render-live: stream tool calls and their results"), "")
+
+    def test_a_bare_noun_phrase_holds(self):
+        self.assertEqual(MOD.name_problem("kodama"), "")
+
+    def test_a_trailing_question_mark_fails(self):
+        self.assertIn("asks a question",
+                      MOD.name_problem("wisp render-live?"))
+
+    def test_a_leading_interrogative_fails(self):
+        self.assertIn("asks a question",
+                      MOD.name_problem("Can wisp render-live stream?"))
+
+    def test_a_leading_auxiliary_fails(self):
+        self.assertIn("asks a question",
+                      MOD.name_problem("should the commit rename"))
+
+    def test_a_long_name_fails(self):
+        self.assertIn("12 words",
+                      MOD.name_problem(" ".join(["word"] * 13)))
+
+    def test_twelve_words_hold(self):
+        self.assertEqual(MOD.name_problem(" ".join(["word"] * 12)), "")
+
+    def test_an_empty_name_fails(self):
+        self.assertIn("empty", MOD.name_problem("   "))
 
 
 class CommitSubjectTests(unittest.TestCase):
@@ -1097,12 +1233,38 @@ class PromptFileTests(unittest.TestCase):
         self.assertNotIn("every session dir that `sessions.txt` names",
                          text)
 
+    def test_the_commit_rewrites_the_ticket_name(self):
+        text = self.read("commit-rules.md")
+        self.assertIn("## The name", text)
+        self.assertIn("can wisp render-live stream tool calls?", text)
+        self.assertIn("wisp render-live: stream tool calls and their"
+                      " results", text)
+        self.assertIn("at most 12 words", text)
+        self.assertIn("the name is the one\nfield this turn writes", text)
+        self.assertIn("Edit the `name:` line in the ticket frontmatter",
+                      text)
+
+    def test_the_commit_builds_the_subject_from_the_name(self):
+        text = self.read("commit-rules.md")
+        self.assertIn("<status>(<id>): <name>", text)
+        self.assertIn("Build the subject as", text)
+        self.assertNotIn("Use the subject given above", text)
+
     def test_the_commit_amends_only_on_request(self):
         text = self.read("commit-rules.md")
         self.assertIn("If the user did not ask you to amend", text)
         self.assertIn("amend the HEAD commit", text)
         self.assertIn("Do not rebase or reset.", text)
         self.assertNotIn("Do not amend, rebase, or reset.", text)
+
+    def test_the_commit_describes_the_repair_turn(self):
+        text = self.read("commit-rules.md")
+        self.assertIn("## The repair turn", text)
+        self.assertIn("The seal has no human gate", text)
+        self.assertIn("or wispy sent a repair", text)
+        self.assertIn("turn, amend the HEAD commit", text)
+        self.assertIn("A failure that survives the repair turn stands", text)
+        self.assertNotIn("exits 1, and leaves the commit in place", text)
 
 
 if __name__ == "__main__":

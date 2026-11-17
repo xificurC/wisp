@@ -67,6 +67,7 @@ A wrapper around `wisp` and `tikit`. Added functionality:
 - `tikit` creation and maintenance
 - one-shot sessions. Every `wispy run` is a fresh LLM session, reading the ticket and state from the last `wispy run`.
 - auto-compaction. `wispy run --context-guard 500k`, upon reaching the limit it forces a compaction and starts a new session.
+- commit naming. `wispy commit` rewrites the ticket name as a definition of the work done, and the subject carries that name: `<status>(<id>): <name>`. A name that fails the rule gets one repair turn; a second failure stands.
 
 ### Example run
 

@@ -36,10 +36,30 @@ wispy response
 unset, or unresolved value exits 2 before any model call.
 
 `wispy commit --close` writes `status: 'closed'` into the ticket before
-the commit prompt is built. The subject then reads `closed(<id>): <name>`,
-the prompt header says the same, and the ticket record that the commit
-stages agrees with its subject. Without `--close`, the subject carries
-the status that the ticket holds when the command starts.
+the commit prompt is built, so the committed record carries the final
+status. Without `--close`, the subject carries the status that the ticket
+holds when the command starts.
+
+The commit session also owns the ticket name. The name written when the
+ticket opened often states the request, not the work:
+`can wisp render-live stream tool calls?`. The session rewrites the
+`name:` line as a definition of the work done,
+`wisp render-live: stream tool calls and their results`, and builds the
+subject `<status>(<id>): <name>` from that name. `wispy` writes one
+ticket field, the status; the session writes the name.
+
+The subject is never frozen into the prompt. The prompt header carries
+the id, the name, and the status, and the subject form alone. The session
+derives the literal from the ticket after the rename. After the commit
+`wispy` reads the committed name and `git log -1 --format=%s`. A name
+that asks a question, a name past 12 words, or a subject that carries
+another name opens one repair turn in the same session: the repair turn
+edits the name and amends HEAD. A failure that survives the repair turn
+stands, and `wispy` accepts the commit.
+
+The name rule: a name defines the work. It is a short noun phrase or
+`<component>: <effect>`, lowercase, with no trailing question mark, with
+no interrogative or auxiliary lead word, and at most 12 words.
 
 ## The two files
 
@@ -90,8 +110,13 @@ exits 2. This is the gate: two commands cannot run at once.
 | `commit` while another phase is open | Exit 2. |
 | Skill name with no body | Exit 2. |
 | Context guard stop | Exit 75, then the loop continues. |
+| `commit`: the committed name asks a question or runs past 12 words | One repair turn, then the commit stands. |
+| `commit`: the subject carries another name | One repair turn, then the commit stands. |
 
-A gate exits before a model call. A gate costs no tokens.
+A gate that exits costs no tokens, because no model call starts. The
+two name checks land after the commit and cost one repair turn each: a
+name edit and `git commit --amend` in the same session. A second failure
+stands, so the seal never asks a human to amend.
 
 ## Ctrl-C
 
