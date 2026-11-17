@@ -121,7 +121,7 @@ if start_fake hang; then
         # Round one is on disk [prompt, tool call, result]; the hung
         # round two never landed: one commit line, no final answer.
         if [ "$rc2" -eq 0 ] \
-           && grep -qF "[bash " "$TESTDIR/past2.txt" \
+           && grep -qF "wisp:tool bash " "$TESTDIR/past2.txt" \
            && grep -qF "committed-round-one" "$TESTDIR/past2.txt" \
            && [ "$(count ' commit records=' "$C2/wisp.log")" -eq 1 ] \
            && ! grep -qF "fake final answer" "$C2/wisp.jsonl" \

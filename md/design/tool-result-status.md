@@ -652,3 +652,151 @@ the wire mappers and the two pinned goldens are untouched, and
 replay with the fence. Check 11 of `tests/test_wisp_tool_status.py`
 pins the fenced shape for a bash pair and the bare tag for
 `load_image`.
+
+## Live streaming: the fragments lead and the status trails (2026-11-17)
+
+The user asked for a live view of both halves of a tool call, with the
+watch capped at `maxKilobytes` and the status line at the end. Two
+additive stream markers carry the fragments:
+
+- `{"wisp":"tool_delta","index":N,"id":...,"name":...,"arguments_delta":"..."}`
+  per provider-normalized fragment, injected by `sse_stream` after
+  `chunk_of`, so all three dialects merge before the display sees a
+  shape.
+- `{"wisp":"tool_output","call_id":...,"content_delta":"..."}` per
+  byte chunk that enters the model-facing head, injected by
+  `Tools._run_tool` through `Executor.run`'s `on_head` callback.
+
+The 2026-11-10 shape put the tag line first and the status second:
+
+```
+[bash 5s 5kb]
+```
+cat ./AI_SETUP_RECIPES.md
+```
+wisp:tool bash exit=0 ms=13
+# AI setup recipes
+```
+
+The streaming shape puts the tag line after the fence and the status
+after the content:
+
+```
+```
+cat ./AI_SETUP_RECIPES.md
+```
+[bash 5s 5kb]
+
+# AI setup recipes
+wisp:tool bash exit=0 ms=13
+```
+
+Two placements moved for one reason: the data arrives first.
+`timeoutSeconds` and `maxKilobytes` are model-chosen arguments, so the
+tag cannot be final until the argument JSON ends; the output bytes
+exist only after the process starts, so the status cannot lead the
+content. The command and the output therefore stream, and the two
+lines that describe them close their blocks.
+
+What did not change: `tool_text_of`, the three wire mappers, and the
+system-prompt paragraph above. The model still receives the prefix
+header, and every dialect still agrees on it. What changed is the
+renderer's order, and with it the old claim in the renderer docstring
+that the human sees exactly the model's text. Decision 1's evidence
+still governs the model wire; the human view is a watch, not a wire.
+
+The cap is the model's cap: the stream carries the head and stops, so
+the watch and the model read the same bytes, and the trailing status
+line reports `bytes`, `offset`, `rest_kb`, and `spill` when a tail
+exists. `render-past` keeps its batch shape, and the two renderer
+methods draw the same text from stored fields, so the tool blocks of a
+past replay and of the live run are byte-identical; only the `[user]`
+prompt block, which the live stream never carries, differs.
+
+## One status line per tool block (2026-11-17, later the same day)
+
+The user read the streaming shape above and rejected the second
+metadata line: the `[bash 30s 50kb]` tag after the fence and the
+`wisp:tool bash exit=0 ms=5` status after the output read as two
+trailing lines about one call. The shipped shape merges both facts into
+one line that closes the block:
+
+```
+echo "hi" there
+```
+
+hi there
+wisp:tool bash timeoutSeconds=30 maxKilobytes=50 exit=0 ms=5
+```
+
+`Renderer.tool_header` no longer writes a tag line. The header parks
+`timeoutSeconds` and `maxKilobytes` on `Renderer._budget`, and
+`Renderer.tool_result` passes the parked pair to
+`tool_text_of(rec, budget)`, which inserts the two `key=value` tokens
+between the tool name and `exit=`. The argument names match the tool
+schema, so a reader can grep for the same name the model writes.
+
+The model wire does not move. `tool_text_of(rec)` with no budget keeps
+the prefix header derived from the record alone; the record never
+stores the requested limits. The human line therefore carries two
+fields the model line lacks, exactly the two facts the old tag line
+already carried for the human alone.
+
+Three smaller consequences:
+
+- A `tool_result` with no preceding header, such as a bare result
+  payload on a hand-fed stream, prints the old line with no budget.
+- A call with no command and no drawn fence, such as a `load_image`
+  with a bad path, draws nothing at header time; no separator line is
+  spent on it, and the status line alone names the call.
+- `timeout_s=` keeps its meaning: it appears only when a timeout
+  fired, while `timeoutSeconds=` is the limit the call asked for. On a
+  timeout both carry the same number.
+
+Tradeoff: while a command runs, no status line describes it until the
+process exits, because the limits now ride the closing line. The user
+chose one line per call over a mid-block header.
+
+`render-past` and the live stream stay byte-identical because both feed
+the same two renderer methods: `records_to_stream` emits the stored
+`tool_call` payload, which parks the same budget, then the stored
+result, which closes with the same merged line. `tests/test_wisp_tool_status.py`,
+`tests/test_tool_result_reset.py`, `wisp/tests/test_stream_render.py`,
+`tests/test_wisp_run_nonstream.sh`, and
+`tests/test_wisp_per_round_commit.sh` pin the merged shape.
+
+## The call fence names its language (2026-11-17)
+
+The user asked for the tool call's code fence to carry the tool name as
+its info string, so the block is easier to find in a long render and a
+terminal can highlight the command:
+
+    ```bash
+    echo hi
+    ```
+
+The shapes quoted in the sections above keep their plain fences: they
+record what shipped on their dates. The shipped rule is `fence_of(name)`
+(wisp/wisp): `bash` and `python3` open `` ```bash `` or `` ```python3 ``;
+every other name opens the plain fence, because a `load_image` block draws a path and an unknown
+tool draws raw arguments, and a language tag would mislead there.
+
+Two consequences:
+
+- `Renderer.tool_delta` opens the fence at the first fragment that
+  carries the name, not at the first fragment. The name leads the
+  arguments in every wire dialect, so the wait normally costs nothing;
+  a wire that sends an argument fragment first buffers that text in
+  `raw` and draws it once the name lands. A call that never learns its
+  name draws no fence, and `tool_header` then draws the whole block
+  from the inject payload, tagged the same way.
+- `Renderer.tool_header` tags the fence in both of its draw paths: the
+  streamed path closes the fence `tool_delta` opened, and the
+  whole-block path opens it with `fence_of(name)`. Replay and live
+  therefore stay byte-identical.
+
+The closing fence stays plain. `wisp/tests/test_stream_render.py` pins
+the tagged fence for a streamed bash call, a python3 call, a name that
+trails the first fragment, a nameless call, a whole-block draw, and
+keeps the plain fence for `load_image`; `tests/test_wisp_tool_status.py`
+pins the tagged fence on the batch path.

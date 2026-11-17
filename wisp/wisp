@@ -34,10 +34,14 @@ the next `wisp run` injects them before its prompt, so no message is
 lost.
 
 wisp render-live opens each thinking block with a `[think]` marker line and
-each output block with an `[answer]` marker line, prints each tool-call
-header as `[bash 5s 5kb]` with the command on the next line, and prints
-each tool result as the same text the model receives: the `wisp:tool`
-status header line followed by the raw output.
+each output block with an `[answer]` marker line. A tool call prints its
+command in a fence tagged with the tool name (`bash`, `python3`), grows
+the command while the model writes it, and
+closes with one `wisp:tool` status line that carries the call's
+timeoutSeconds and maxKilobytes; a tool result streams its output head
+while the call runs and closes with that same status line, capped at
+the call's maxKilobytes. The model receives the status
+line first; the human view puts it last because the output arrives first.
 Tools: bash and python3, 5s default timeout, 5kB default output cap,
 spill files under <DIR>/spill/ only when the output overflows the
 cap or the command itself exceeds 64kB, never deleted. load_image
@@ -73,6 +77,7 @@ that wisp copies into wisp.modelcfg.
 from __future__ import annotations
 
 import base64
+import codecs
 import contextlib
 import io
 import json
@@ -517,7 +522,10 @@ After a run, read state with these commands only:
 "usage -d DIR" shows cost and token data for the run.
 Each tool call gets a {"wisp":"tool_call",...} data: line before wisp
 runs the call. The tool note follows the result. Read both before you
-decide.
+decide. While the model writes a call, {"wisp":"tool_delta",...} lines
+carry its argument fragments; while the call runs, {"wisp":"tool_output",
+...} lines carry the head of its output. Both are display hints: the
+tool_call and tool_result lines carry the facts.
 load_image takes a path and an optional resize flag. The default
 resize true fits the image into the default dimension and byte
 limits. resize false sends the file bytes unchanged.
@@ -2129,10 +2137,14 @@ def command_help_text(cmd: str) -> str:
             "  wisp render-live < stream",
             "",
             "Each thinking block opens with a [think] marker line and each",
-            "output block with [answer]. Tool-call headers print as",
-            "[bash 5s 5kb] with the command on the next line; each tool",
-            "result prints the wisp:tool status header line and the raw",
-            "output, the same text the model receives.",
+            "output block with [answer]. A tool call prints its command in",
+            "a fence tagged with the tool name (bash, python3), grows while",
+            "the model writes the arguments, and closes with no separate",
+            "tag line. A tool result streams its output head",
+            "while the call runs and closes the block with one wisp:tool",
+            "status line carrying the call's timeoutSeconds, maxKilobytes,",
+            "exit code and duration. The head is capped at the call's",
+            "maxKilobytes so the watch and the model see the same head.",
         ]) + "\n",
         "render-past": "\n".join([
             "wisp render-past: render a past run.",
@@ -2477,13 +2489,17 @@ DRAIN_GRACE_SECONDS = 1  # bound on the post-kill / post-child-exit drain
 class Executor:
     """Runs one argv with a byte cap and a lazy spill file.
 
-    run(argv, seconds, cap_bytes, spill_path_of) -> (rc, head, spill):
-    stdout (with stderr joined) reads through a select loop, deadline
-    enforced by the clock service; a timeout kills the child and rc is
-    124. The head holds at most cap_bytes and is filled to exactly
-    cap_bytes on overflow; the moment output passes
+    run(argv, seconds, cap_bytes, spill_path_of, on_head) -> (rc, head,
+    spill): stdout (with stderr joined) reads through a select loop,
+    deadline enforced by the clock service; a timeout kills the child
+    and rc is 124. The head holds at most cap_bytes and is filled to
+    exactly cap_bytes on overflow; the moment output passes
     cap_bytes, a spill file is created exactly once through
     spill_path_of() and the full output streams into it, head included.
+    on_head, when given, receives each byte chunk that enters the head,
+    in order, so a watcher can read the output as it runs; the bytes
+    past the cap go to the spill and never reach on_head, so the watch
+    and the model see the same head.
     With no overflow the spill is None and no file exists, on a timeout
     too: a fitting partial rides in the head, so refetching it from a
     spill would add no information. stdin is /dev/null. The child runs
@@ -2506,7 +2522,8 @@ class Executor:
             return 124, ""
         return proc.returncode, proc.stdout or ""
 
-    def run(self, argv: list, seconds: int, cap_bytes: int, spill_path_of: Callable) -> tuple:
+    def run(self, argv: list, seconds: int, cap_bytes: int,
+            spill_path_of: Callable, on_head: Callable | None = None) -> tuple:
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True)
@@ -2517,17 +2534,21 @@ class Executor:
         def route(chunk: bytes) -> None:
             if spill_out[0] is not None:
                 spill_out[0].write(chunk)
-            else:
-                space = cap_bytes - len(head)
-                if space >= len(chunk):
-                    head.extend(chunk)
-                    return
-                spill_path[0] = spill_path_of()
-                spill_out[0] = open(spill_path[0], "wb")
-                spill_out[0].write(bytes(head))
-                spill_out[0].write(chunk)
-                if space > 0:
-                    head.extend(chunk[:space])
+                return
+            space = cap_bytes - len(head)
+            if space >= len(chunk):
+                head.extend(chunk)
+                if on_head is not None:
+                    on_head(chunk)
+                return
+            spill_path[0] = spill_path_of()
+            spill_out[0] = open(spill_path[0], "wb")
+            spill_out[0].write(bytes(head))
+            spill_out[0].write(chunk)
+            if space > 0:
+                head.extend(chunk[:space])
+                if on_head is not None:
+                    on_head(chunk[:space])
 
         fd = proc.stdout.fileno()
         deadline = self._world.get("clock").monotonic() + seconds
@@ -2799,7 +2820,9 @@ class Tools:
 
     execute(calls) -> tool records, one per call, run order. Each call
     injects `data: {"wisp":"tool_call","name":...,"timeoutSeconds":...,
-    "maxKilobytes":...,"command":...}` before it runs and
+    "maxKilobytes":...,"command":...}` before it runs,
+    `data: {"wisp":"tool_output","call_id":...,"content_delta":...}` for
+    each chunk of the output head while it runs, and
     `data: {"wisp":"tool_result","name":...,"call_id":...,"content":...,
     "exit":...,"ms":...}` after, plus the anomaly fields the record
     carries. Defaults: 5s timeout, 5kB output cap. A command
@@ -2927,8 +2950,22 @@ class Tools:
         memory. A spill file appears only when the output overflows the
         cap or the command itself exceeds 64kB; it is never deleted.
         """
+        call_id = record.get("call_id")
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+
+        def on_head(chunk: bytes) -> None:
+            text = decoder.decode(chunk)
+            if text:
+                self._inject({"wisp": "tool_output", "call_id": call_id,
+                              "content_delta": text})
+
         rc, head, spill_path, abandoned = self._world.get("exec").run(
-            self._argv(name, command), seconds, maxkb * 1000, self._spill)
+            self._argv(name, command), seconds, maxkb * 1000, self._spill,
+            on_head)
+        tail = decoder.decode(b"", True)
+        if tail:
+            self._inject({"wisp": "tool_output", "call_id": call_id,
+                          "content_delta": tail})
         record["exit"] = rc
         record["content"] = head.decode("utf-8", "replace")
         if spill_path:
@@ -3170,6 +3207,7 @@ class Llm:
 
     def __init__(self, world: World):
         self._world = world
+        self._budget = ()          # call limits awaiting the status line
         self._think_fields = (
             world.get("env").get("WISP_THINK_FIELDS", DEFAULT_THINK_FIELDS).split(",")
         )
@@ -3460,16 +3498,23 @@ def tool_status_of(rec: dict) -> dict:
     return {key: rec[key] for key in TOOL_STATUS_FIELDS
             if rec.get(key) is not None}
 
-def tool_text_of(rec: dict) -> str:
+def tool_text_of(rec: dict, budget: tuple = ()) -> str:
     """The model-facing text of one tool record.
 
     One status header line, then the raw output. The header is derived
     from stored fields at wire time, so `content` stays raw in
     wisp.jsonl. Position authenticates the header: a command cannot
     print before its own output, so a forged `wisp:tool` line lands
-    after the true one and reads as output."""
-    parts = ["wisp:tool", rec.get("name") or "",
-             "exit=%d" % int(rec.get("exit") or 0)]
+    after the true one and reads as output.
+
+    budget, when given, lands between the name and exit. The human
+    renderer passes the call's model-chosen timeoutSeconds and
+    maxKilobytes, which the record does not keep: the merged line then
+    names the limits and the outcome together. The model wire passes
+    nothing, so its header stays derived from the record alone."""
+    parts = ["wisp:tool", rec.get("name") or ""]
+    parts += list(budget)
+    parts.append("exit=%d" % int(rec.get("exit") or 0))
     if rec.get("ms") is not None:
         parts.append("ms=%d" % int(rec["ms"]))
     if rec.get("spill"):
@@ -4101,6 +4146,36 @@ def chunk_of(provider: str, payload: dict) -> dict | None:
     return anthropic_chunk_of(payload)
 
 
+def tool_deltas_of(chunk: dict) -> list:
+    """The tool_delta markers for one normalized chunk.
+
+    A provider stream carries tool-call arguments as fragments, so the
+    live renderer can draw the call while the model writes it. One
+    marker per fragment: the call index always, the id and name only on
+    the fragment that carries them, and the argument fragment as
+    arguments_delta. The chunk comes from chunk_of, so the three
+    dialects are already merged here and the renderer never reads a
+    provider payload. A fragment with no new fact yields no marker.
+    """
+    choices = chunk.get("choices") or []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    markers = []
+    for call in (choice.get("delta") or {}).get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") or {}
+        marker = {"wisp": "tool_delta", "index": call.get("index", 0)}
+        if call.get("id"):
+            marker["id"] = call["id"]
+        if fn.get("name"):
+            marker["name"] = fn["name"]
+        if fn.get("arguments"):
+            marker["arguments_delta"] = fn["arguments"]
+        if len(marker) > 2:
+            markers.append(marker)
+    return markers
+
+
 def trace_fields_of(meta: dict) -> list:
     """The response status and request id as wisp.log fields.
 
@@ -4198,6 +4273,9 @@ def sse_stream(world: World, body: dict) -> Iterator[dict]:
             if chunk is not None:
                 accepted = True
                 payloads += 1
+                for marker in tool_deltas_of(chunk):
+                    out.write("data: %s\n" % json.dumps(
+                        marker, ensure_ascii=False))
                 yield chunk
     except HttpError as exc:
         safe_log(world, "http_error", "url=%s" % url,
@@ -4481,21 +4559,175 @@ def agents_md_files(world: World) -> list:
 THINK_LABEL = "[think]\n"
 ANSWER_LABEL = "[answer]\n"
 
+JSON_ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b",
+                "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+"""The single-character escapes of a JSON string."""
+
+def _hex4(text: str) -> str | None:
+    """One \\u escape's four hex digits as a character, or None when
+    the text holds fewer than four digits or a non-hex digit."""
+    if len(text) < 4 or any(c not in "0123456789abcdefABCDEF" for c in text):
+        return None
+    return chr(int(text, 16))
+
+
+def decode_json_prefix(text: str) -> tuple:
+    """Decode a JSON string body prefix, complete or still being written.
+
+    Returns (decoded, used, closed): the decoded characters, the number
+    of input characters consumed, and whether the closing quote was
+    seen. An escape the text does not hold yet is not consumed, so the
+    caller retries it after the next fragment lands. A surrogate pair
+    combines; a lone surrogate becomes U+FFFD, so the text always
+    prints. This is the one decoder for a value the model is still
+    writing and for a finished key token.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        char = text[i]
+        if char == '"':
+            return "".join(out), i, True
+        if char != "\\":
+            out.append("\ufffd" if "\ud800" <= char <= "\udfff" else char)
+            i += 1
+            continue
+        if i + 1 >= n:
+            break
+        escape = text[i + 1]
+        if escape == "u":
+            if i + 6 > n:
+                break
+            unit = _hex4(text[i + 2:i + 6])
+            if unit is None:
+                break
+            if "\ud800" <= unit <= "\udbff":
+                if i + 6 == n:
+                    break
+                pair = text[i + 6:i + 8]
+                if pair == "\\u" and i + 12 > n:
+                    break
+                low = _hex4(text[i + 8:i + 12]) if pair == "\\u" else None
+                if low is not None and "\udc00" <= low <= "\udfff":
+                    unit = chr(0x10000 + ((ord(unit) - 0xD800) << 10)
+                               + (ord(low) - 0xDC00))
+                    i += 6
+                else:
+                    unit = "\ufffd"
+            elif "\ud800" <= unit <= "\udfff":
+                unit = "\ufffd"
+            out.append(unit)
+            i += 6
+            continue
+        if escape not in JSON_ESCAPES:
+            break
+        out.append(JSON_ESCAPES[escape])
+        i += 2
+    return "".join(out), i, False
+
+
+def decode_json_string(text: str) -> str:
+    """The decoded prefix of a JSON string body."""
+    return decode_json_prefix(text)[0]
+
+
+def json_string_value_start(raw: str, key: str) -> int | None:
+    """The index just past the opening quote of one top-level string
+    field in a JSON object that is still being written, or None while
+    the field has not appeared.
+
+    The scan is JSON-aware: a completed string token is skipped whole,
+    so a key name inside an earlier value cannot match.
+    """
+    i = 0
+    depth = 0
+    n = len(raw)
+    while i < n:
+        char = raw[i]
+        if char == '"':
+            j = i + 1
+            while j < n:
+                if raw[j] == "\\":
+                    j += 2
+                    continue
+                if raw[j] == '"':
+                    break
+                j += 1
+            closed = j < n
+            if depth == 1 and closed:
+                k = j + 1
+                while k < n and raw[k] in " \t\r\n":
+                    k += 1
+                if (k < n and raw[k] == ":"
+                        and decode_json_string(raw[i + 1:j]) == key):
+                    k += 1
+                    while k < n and raw[k] in " \t\r\n":
+                        k += 1
+                    if k < n and raw[k] == '"':
+                        return k + 1
+                    return None
+            i = j + 1 if closed else n
+            continue
+        if char in "{[":
+            depth += 1
+        elif char in "}]":
+            depth -= 1
+            if depth <= 0:
+                return None
+        i += 1
+    return None
+
+
+def display_key_of(name: str) -> str | None:
+    """The argument field a call's streamed preview shows: command for
+    bash and python3, path for load_image, and None for any other name,
+    whose raw arguments show instead. The finished tool_call payload
+    makes the same choice, so the streamed text is its prefix."""
+    if name == "load_image":
+        return "path"
+    if name in ("bash", "python3"):
+        return "command"
+    return None
+
+
+def fence_of(name: str) -> str:
+    """The opening code fence for a call's drawn text, newline included.
+
+    A bash or python3 call draws its command, so the fence names the
+    language: a reader finds the block by the same word the call uses,
+    and a terminal that highlights fenced code colors it. Every other
+    call draws a path or raw arguments, where a language tag would
+    mislead, so the plain fence stays.
+    """
+    if name in ("bash", "python3"):
+        return "```%s\n" % name
+    return "```\n"
+
 
 class Renderer:
     """Renders the run stdout stream (raw SSE plus injected tool records)
-    to plain text: a `[think]` marker line opens each thinking block, an
-    `[answer]` marker line opens each output block, each tool-call header
-    tag line carries the command in a code fence below it, and each tool result prints
-    the exact text the model receives, no colors. render-past replays
-    committed system and user records through the prompt() path as a
-    `[system]` or `[user]` marker line; the live stream never carries
-    one. A
-    steered user record replays through the steer() path as a `[steer]`
-    marker line, the same shape the live drain injected."""
+    to plain text, no colors.
+
+    A `[think]` marker line opens each thinking block and an `[answer]`
+    marker line opens each output block. A tool call opens with the
+    command in a code fence whose info string is the call's name
+    (`bash`, `python3`) and grows while the model writes the
+    arguments. A tool result streams its output head while the call runs
+    and closes the block with one `wisp:tool` status line carrying the
+    call's timeoutSeconds and maxKilobytes plus the record's exit and
+    duration. The status trails on the human view because the output
+    arrives first; the model-facing tool text keeps the status first.
+
+    render-past replays committed system and user records through the
+    prompt() path as a `[system]` or `[user]` marker line; the live
+    stream never carries one. A steered user record replays through the
+    steer() path as a `[steer]` marker line, the same shape the live
+    drain injected."""
 
     def __init__(self, world: World):
         self._world = world
+        self._budget = ()          # call limits awaiting the status line
         self._think_fields = (
             world.get("env").get("WISP_THINK_FIELDS", DEFAULT_THINK_FIELDS).split(",")
         )
@@ -4503,11 +4735,33 @@ class Renderer:
         self._last_kind = None
         self._labeled = False
         self._open_line = False
+        self._call = None          # the streamed call block being drawn
+        self._closed = []          # streamed calls whose fence is closed
+        self._output_call = None   # call_id whose output already streamed
+
+    def _write(self, text: str) -> None:
+        """Write raw text and track whether the stream sits mid-line."""
+        self._out.write(text)
+        if text:
+            self._open_line = not text.endswith("\n")
 
     def _before(self, kind: str) -> None:
         """One blank separator pair and a fresh label when the kind changes."""
         if self._last_kind is not None and self._last_kind != kind:
             self._out.write("\n\n")
+            self._labeled = False
+        self._last_kind = kind
+
+    def _gap(self, kind: str) -> None:
+        """One blank line before a block that opens on a fresh line.
+
+        A blank separator pair after a line the block already closed
+        with a newline would print two empty lines, so this seam writes
+        the exact number of newlines the transition needs."""
+        if self._last_kind is not None and self._last_kind != kind:
+            if self._open_line:
+                self._write("\n")
+            self._write("\n")
             self._labeled = False
         self._last_kind = kind
 
@@ -4532,7 +4786,11 @@ class Renderer:
         if not isinstance(payload, dict):
             return
         marker = payload.get("wisp")
-        if marker == "tool_call":
+        if marker == "tool_delta":
+            self.tool_delta(payload)
+        elif marker == "tool_output":
+            self.tool_output(payload)
+        elif marker == "tool_call":
             self.tool_header(payload)
         elif marker == "tool_result":
             self.tool_result(payload)
@@ -4554,35 +4812,176 @@ class Renderer:
             self._before("text")
             self._emit(ANSWER_LABEL, content)
 
+    def tool_delta(self, payload: dict) -> None:
+        """Stream one argument fragment of a call the model is writing.
+
+        The first fragment that names the call opens the code fence with
+        the call's name as the info string (`bash`, `python3`, or none);
+        every later fragment appends the decoded text, so the command
+        grows while the model writes it. The printed text is the partial
+        JSON of the field the finished call will show: command for bash
+        and python3, path for load_image, the raw arguments for any
+        other name. The budget waits for tool_header, which learns
+        timeoutSeconds and maxKilobytes only when the arguments end, and
+        tool_result folds the budget into the closing status line.
+        """
+        index = payload.get("index", 0)
+        if self._call is not None and self._call["index"] != index:
+            self._close_call()
+        if self._call is None:
+            self._call = {"index": index, "name": "", "raw": "", "shown": "",
+                          "key": None, "pos": None, "closed": False,
+                          "opened": False}
+        call = self._call
+        if payload.get("name"):
+            call["name"] = payload["name"]
+        call["raw"] += payload.get("arguments_delta") or ""
+        if not call["name"]:
+            return  # the name leads the arguments in every wire dialect
+        if not call["opened"]:
+            # The fence carries the language, so it waits for the name.
+            # A wire that sends an argument fragment first keeps that
+            # text in raw and draws it once the name lands.
+            self._before("tool_call")
+            self._write(fence_of(call["name"]))
+            call["opened"] = True
+        key = display_key_of(call["name"])
+        if key != call["key"]:
+            call["key"] = key
+            call["shown"] = ""
+            call["pos"] = 0 if key is None else None
+        if key is None:
+            text = call["raw"][len(call["shown"]):]
+            call["shown"] = call["raw"]
+            self._write(text)
+            return
+        if call["pos"] is None:
+            call["pos"] = json_string_value_start(call["raw"], key)
+            if call["pos"] is None:
+                return  # the field has not started yet
+        text, used, _closed = decode_json_prefix(call["raw"][call["pos"]:])
+        call["pos"] += used
+        if text:
+            call["shown"] += text
+            self._write(text)
+
+    def _close_call(self) -> None:
+        """Close a streamed call's fence and park the call for its tag.
+
+        A call that never learned its name drew no fence, so it parks
+        unclosed and tool_header draws the whole block from the inject.
+        """
+        call = self._call
+        if call is None:
+            return
+        if call["opened"]:
+            if self._open_line:
+                self._write("\n")
+            self._write("```\n")
+        call["closed"] = True
+        self._closed.append(call)
+        self._call = None
+
+    def _drawn_call(self) -> dict | None:
+        """The streamed call block the finished arguments belong to.
+
+        Tools run in block order and the inject says nothing about the
+        index, so the oldest drawn call wins; an interleaved second
+        index parks behind it.
+        """
+        if self._closed:
+            return self._closed.pop(0)
+        call, self._call = self._call, None
+        return call
+
     def tool_header(self, payload: dict) -> None:
-        """The [name 5s 5kb] tag line, then the command fenced in a
-        triple-backtick block so it cannot join the tag line or the
-        agent block below; a call with broken arguments shows ?s ?kB
-        and the raw argument text."""
+        """The call block: the command in a triple-backtick fence, and
+        nothing else.
+
+        A call the stream already drew finishes its fence here; a call
+        with no fragments - a replayed record, a non-stream turn, a
+        broken argument list - draws the whole block here. The
+        model-chosen timeoutSeconds and maxKilobytes do not print on
+        their own line: tool_result adds them to the single `wisp:tool`
+        status line that closes the block. A call with broken arguments
+        shows `?` for both limits and the raw argument text in the
+        fence. A call with no command and no drawn fence, such as a
+        load_image with a bad path, draws nothing here: the result's
+        status line alone names it. The fence's info string is the
+        call's name for bash and python3, the same fence the streamed
+        fragments opened, so a replay draws the block byte for byte.
+        """
         name = payload.get("name", "tool")
         seconds = payload.get("timeoutSeconds", DEFAULT_TOOL_TIMEOUT)
         maxkb = payload.get("maxKilobytes", DEFAULT_TOOL_MAXKB)
         command = payload.get("command", "")
-        self._before("tool_call")
-        if name == "load_image":
-            self._out.write("[load_image]\n")
+        call = self._drawn_call()
+        if call is not None and not call["opened"]:
+            call = None  # no fence was drawn, so draw the whole block
+        if call is not None:
+            shown = call["shown"]
+            if not call["closed"]:
+                if isinstance(command, str) and command.startswith(shown):
+                    self._write(command[len(shown):])
+                if self._open_line:
+                    self._write("\n")
+                self._write("```\n")
+        elif command:
+            self._before("tool_call")
+            self._write(fence_of(name) + command)
+            if not command.endswith("\n"):
+                self._write("\n")
+            self._write("```\n")
+        if name in ("bash", "python3"):
+            self._budget = ("timeoutSeconds=%s" % seconds,
+                            "maxKilobytes=%s" % maxkb)
         else:
-            self._out.write("[%s %ss %skb]\n" % (name, seconds, maxkb))
-        if command:
-            self._out.write("```\n%s\n```\n" % command)
-        self._open_line = False
+            self._budget = ()
+
+    def tool_output(self, payload: dict) -> None:
+        """Stream the output head of a running call.
+
+        The producer sends only the bytes that entered the model-facing
+        head, so the watch and the model read the same text and the
+        spill tail never streams. The status line follows the last
+        fragment in tool_result, which skips the content it already
+        streamed.
+        """
+        self._output_call = payload.get("call_id")
+        self._gap("tool_result")
+        self._write(payload.get("content_delta") or "")
 
     def tool_result(self, payload: dict) -> None:
-        """Print the tool text the model receives: the `wisp:tool` status
-        header line and the raw output below it. One rendering path, so a
-        human reads the agent's view without a translation step."""
-        text = tool_text_of(payload)
-        self._out.write(text if text.endswith("\n") else text + "\n")
+        """Print the call's output, then its `wisp:tool` status line.
+
+        The output led as it ran, so the status closes the block. A
+        result whose output already streamed prints the status line
+        alone; one that never streamed - load_image, a replayed record,
+        a run with no head - prints its content here. One line carries
+        both the limits the call chose and the outcome it reached: the
+        header parked the timeoutSeconds and maxKilobytes, and
+        tool_text_of appends the record's own fields. Field set and
+        wording of the outcome are tool_text_of's, so both views name
+        the same facts.
+        """
+        text = tool_text_of(payload, self._budget)
+        self._budget = ()
+        status, _sep, content = text.partition("\n")
+        self._gap("tool_result")
+        streamed = (self._output_call is not None
+                    and self._output_call == payload.get("call_id"))
+        if content and not streamed:
+            self._write(content if content.endswith("\n") else content + "\n")
+        if self._open_line:
+            self._write("\n")
+        self._write(status + "\n")
         # A tool result may leave a color or other SGR state active at its
         # end (the command never reset it, or the output cap cut off its
         # reset).  Close that state so it cannot bleed into later render
-        # output.  ESC[0m with no active attributes is a no-op.
-        self._out.write("\x1b[0m\n")
+        # output.  ESC[0m with no active attributes is a no-op.  The reset
+        # closes the block, so it lands after the last streamed byte.
+        self._write("\x1b[0m\n")
+        self._output_call = None
         self._last_kind = "tool_result"
         self._labeled = False
         self._open_line = False
@@ -4601,6 +5000,10 @@ class Renderer:
         self._emit("[steer]\n", payload.get("content", ""))
 
     def finish(self) -> None:
+        """Close a dangling call fence and a dangling line, then forget
+        the block kind so the next renderer starts clean."""
+        self._close_call()
+        self._closed = []
         if self._open_line:
             self._out.write("\n")
         self._last_kind = None

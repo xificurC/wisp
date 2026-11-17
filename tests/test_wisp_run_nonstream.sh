@@ -109,7 +109,7 @@ PROMPT
     $WISP render-past -d "$C" > "$TESTDIR/past.txt" 2>/dev/null
     if [ "$($WISP response -d "$C")" = "the fake final answer" ] \
        && grep -qF "the fake final answer" "$TESTDIR/past.txt" \
-       && grep -qF "[bash " "$TESTDIR/past.txt"; then
+       && grep -qF "wisp:tool bash " "$TESTDIR/past.txt"; then
         check "5: response and render-past show the answer" 0
     else
         check "5: response and render-past show the answer" 1

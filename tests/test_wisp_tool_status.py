@@ -68,7 +68,7 @@ class FakeExec:
         self.result = result
         self.calls = []
 
-    def run(self, argv, seconds, cap_bytes, spill_path_of):
+    def run(self, argv, seconds, cap_bytes, spill_path_of, on_head=None):
         self.calls.append((argv, seconds, cap_bytes))
         return self.result
 
@@ -203,14 +203,15 @@ for mapper in (wisp.message_of, wisp.items_of_responses,
     resumed = json.dumps(mapper(roundtripped), sort_keys=True)
     assert fresh == resumed, (mapper.__name__, fresh, resumed)
 
-# --- 11. the renderer prints the same header the model receives ----------
+# --- 11. the renderer prints the same fields the model receives, with the
+# status line closing the block -----------------------------------------
 world, fs, clock, out, session = world_of()
 renderer = wisp.Renderer(world)
 renderer.render_line("data: " + json.dumps({
     "wisp": "tool_result", "name": "bash", "call_id": "call_1",
     "content": "hi\n", "exit": 0, "ms": 431}))
 renderer.finish()
-assert out.text == "wisp:tool bash exit=0 ms=431\nhi\n\x1b[0m\n", out.text
+assert out.text == "hi\nwisp:tool bash exit=0 ms=431\n\x1b[0m\n", out.text
 
 world, fs, clock, out, session = world_of()
 renderer = wisp.Renderer(world)
@@ -219,12 +220,14 @@ renderer.render_line("data: " + json.dumps({
     "content": "head\n", "exit": 1, "ms": 8210, "bytes": 12000,
     "offset": 5001, "rest_kb": 7, "spill": "/sess/spill/7cwfhu3d"}))
 renderer.finish()
-first = out.text.split("\n", 1)[0]
-assert first == ('wisp:tool bash exit=1 ms=8210 bytes=12000 offset=5001 '
-                 'rest_kb=7 spill="/sess/spill/7cwfhu3d"'), out.text
+lines = out.text.split("\n")
+assert lines[0] == "head", out.text
+assert lines[1] == ('wisp:tool bash exit=1 ms=8210 bytes=12000 offset=5001 '
+                    'rest_kb=7 spill="/sess/spill/7cwfhu3d"'), out.text
+assert lines[2] == "\x1b[0m", out.text
 assert "[spill:" not in out.text, out.text
 
-# the command echo sits fenced between the tag line and the agent block
+# the command echo sits fenced, one status line closes the call block
 world, fs, clock, out, session = world_of()
 renderer = wisp.Renderer(world)
 renderer.render_line("data: " + json.dumps({
@@ -235,11 +238,12 @@ renderer.render_line("data: " + json.dumps({
     "wisp": "tool_result", "name": "bash", "call_id": "call_2",
     "content": "# AI setup recipes\n", "exit": 0, "ms": 13}))
 renderer.finish()
-assert out.text == ('[bash 5s 5kb]\n```\ncat ./AI_SETUP_RECIPES.md\n```\n'
-                    'wisp:tool bash exit=0 ms=13\n'
-                    '# AI setup recipes\n\x1b[0m\n'), out.text
+assert out.text == ('```bash\ncat ./AI_SETUP_RECIPES.md\n```\n'
+                    '\n# AI setup recipes\n'
+                    'wisp:tool bash timeoutSeconds=5 maxKilobytes=5'
+                    ' exit=0 ms=13\n\x1b[0m\n'), out.text
 
-# a call with no command (load_image) keeps the bare tag, no fence
+# a call with no command (load_image) draws no fence and no tag
 world, fs, clock, out, session = world_of()
 renderer = wisp.Renderer(world)
 renderer.render_line("data: " + json.dumps({
@@ -249,8 +253,7 @@ renderer.render_line("data: " + json.dumps({
     "wisp": "tool_result", "name": "load_image", "call_id": "call_3",
     "content": "(image/png, 1200 bytes) loaded\n", "exit": 0, "ms": 42}))
 renderer.finish()
-assert out.text == ('[load_image]\n'
-                    'wisp:tool load_image exit=0 ms=42\n'
-                    '(image/png, 1200 bytes) loaded\n\x1b[0m\n'), out.text
+assert out.text == ('(image/png, 1200 bytes) loaded\n'
+                    'wisp:tool load_image exit=0 ms=42\n\x1b[0m\n'), out.text
 
 print("tool-status tests pass")
