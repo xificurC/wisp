@@ -1,5 +1,7 @@
 <git-commit-rules>
 Never leak the used LLM. This includes the API key, the URL, the model alias. Use broader terms like "company LiteLLM server", and generic model names like "DeepSeek V4.1 Flash".
+
+A local, uncommitted `pre-commit` hook scans the staged lines for the company name, the endpoint host, API keys, and API model ids. The hook may refuse the commit and prints one fix hint per rule. Fix the text, re-stage, and commit again. Never pass `--no-verify`.
 </git-commit-rules>
 
 <final-assistant-reply>
