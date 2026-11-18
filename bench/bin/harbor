@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# wisp bench launcher. Puts the bench adapter on PYTHONPATH so
+# `-a wisp_harbor:Wisp` resolves, then execs the first harbor found:
+#   1. bench/.venv/bin/harbor   (created by bench/install.sh)
+#   2. the curated-terminal-benchmark venv (harbor 0.24.0)
+set -euo pipefail
+BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="$BENCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
+
+if [ -x "$BENCH_DIR/.venv/bin/harbor" ]; then
+    exec "$BENCH_DIR/.venv/bin/harbor" "$@"
+fi
+CURATED=/home/pnagyux/code/curated-terminal-benchmark/.venv/bin/harbor
+if [ -x "$CURATED" ]; then
+    exec "$CURATED" "$@"
+fi
+echo "harbor not found. Run: $BENCH_DIR/install.sh" >&2
+exit 127
