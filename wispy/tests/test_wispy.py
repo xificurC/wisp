@@ -315,7 +315,8 @@ class Harness:
     def run(self, *argv):
         try:
             argv = list(argv)
-            if argv and argv[0] in ("run", "continue", "commit") and not any(
+            if argv and argv[0] in ("run", "continue", "demote", "commit") \
+                    and not any(
                     arg.startswith("--model") for arg in argv):
                 argv += ["--model", "test-model"]
             opts = MOD.parse_args(self.world, argv)
@@ -454,6 +455,15 @@ class RunTests(unittest.TestCase):
         self.assertEqual(harness.phase(), "work 001 /s/ai-test-001")
         self.assertEqual(len(harness.exec.stream_calls()), 1)
         self.assertIn("API error", harness.errors())
+
+    def test_http_error_77_maps_to_api_not_distill(self):
+        harness = Harness()
+        harness.exec.streams = [(77, "the answer")]
+        self.assertEqual(harness.run("run"), 1)
+        self.assertEqual(harness.phase(), "work 001 /s/ai-test-001")
+        self.assertEqual(len(harness.exec.stream_calls()), 1)
+        self.assertIn("API error", harness.errors())
+        self.assertIn("wispy demote replaces session", harness.errors())
 
     def test_session_cap_exits_75(self):
         harness = Harness()
@@ -727,6 +737,94 @@ class ContinueTests(unittest.TestCase):
         session = harness.add_session("001")
         harness.fs.write_text(TD + "/.phase", "work 001 %s\n" % session)
         self.assertEqual(harness.run("continue", "--skills", "a"), 2)
+
+
+class DemoteTests(unittest.TestCase):
+    def _poisoned(self, kind="work", after=""):
+        """One ticket whose open phase names a session with work."""
+        harness = Harness()
+        harness.fs.write_text(TD + "/.seq", "1\n")
+        session = harness.add_session("001")
+        marker = "%s 001 %s%s\n" % (kind, session,
+                                     (" " + after) if after else "")
+        harness.fs.write_text(TD + "/.phase", marker)
+        return harness, session
+
+    def test_demote_replaces_a_failed_work_session(self):
+        harness, session = self._poisoned()
+        harness.exec.streams = [(0, "a2"), (0, GOOD_STATE)]
+        self.assertEqual(harness.run("demote"), 0)
+        self.assertEqual(harness.phase(), "")
+        self.assertEqual(harness.fs.files[TD + "/.seq"], "2\n")
+        self.assertEqual(harness.fs.files[TD + "/sessions.txt"],
+                         "%s\n/s/ai-test-002\n" % session)
+        self.assertEqual(harness.fs.files[TD + "/responses/001.md"],
+                         "old 0\n")
+        self.assertEqual(harness.fs.files[TD + "/STATE.md"], GOOD_STATE)
+        work, distill = harness.exec.stream_calls()
+        self.assertEqual(work[1][work[1].index("-d") + 1],
+                         "/s/ai-test-002")
+        self.assertIn("was demoted", work[2])
+        self.assertIn(session, work[2])
+        self.assertTrue(work[3])
+        self.assertFalse(distill[3])
+        self.assertIn("demoted; no later request replays",
+                      harness.errors())
+
+    def test_demote_on_a_distill_phase(self):
+        harness, session = self._poisoned("distill", "STOP")
+        harness.exec.streams = [(0, "a2"), (0, GOOD_STATE)]
+        self.assertEqual(harness.run("demote"), 0)
+        self.assertEqual(harness.phase(), "")
+        self.assertEqual(harness.fs.files[TD + "/responses/001.md"],
+                         "old 0\n")
+        self.assertEqual(harness.fs.files[TD + "/sessions.txt"],
+                         "%s\n/s/ai-test-002\n" % session)
+
+    def test_demote_carries_the_reason(self):
+        harness, session = self._poisoned()
+        harness.exec.streams = [(0, "a2"), (0, GOOD_STATE)]
+        harness.world.set("stdin", FakeStdin("endpoint rejects image"
+                                             " content"))
+        self.assertEqual(harness.run("demote"), 0)
+        work = harness.exec.stream_calls()[0]
+        self.assertIn("Reason: endpoint rejects image content.", work[2])
+
+    def test_demote_without_a_reason_names_the_generic_cause(self):
+        harness, session = self._poisoned()
+        harness.exec.streams = [(0, "a2"), (0, GOOD_STATE)]
+        self.assertEqual(harness.run("demote"), 0)
+        work = harness.exec.stream_calls()[0]
+        self.assertIn("Reason: not given", work[2])
+
+    def test_demote_keeps_the_skills(self):
+        harness, session = self._poisoned()
+        harness.fs.write_text(TD + "/skills/001.txt", "alpha\n")
+        harness.exec.skills = {"alpha": "ALPHA BODY"}
+        harness.exec.streams = [(0, "a2"), (0, GOOD_STATE)]
+        self.assertEqual(harness.run("demote"), 0)
+        self.assertIn("ALPHA BODY",
+                      harness.fs.files[TD + "/personas/002.txt"])
+
+    def test_demote_with_no_marker_exits_two(self):
+        harness = Harness()
+        self.assertEqual(harness.run("demote"), 2)
+        self.assertIn("no open session", harness.errors())
+        self.assertEqual(harness.exec.stream_calls(), [])
+
+    def test_demote_on_a_commit_marker_exits_two(self):
+        harness = Harness()
+        session = harness.add_session("c01")
+        harness.fs.write_text(TD + "/.seq", "1\n")
+        harness.fs.write_text(TD + "/.phase", "commit c01 %s\n" % session)
+        self.assertEqual(harness.run("demote"), 2)
+        self.assertIn("unfinished commit", harness.errors())
+        self.assertEqual(harness.exec.stream_calls(), [])
+
+    def test_demote_refuses_skills(self):
+        harness, session = self._poisoned()
+        self.assertEqual(harness.run("demote", "--skills", "alpha"), 2)
+        self.assertEqual(harness.exec.stream_calls(), [])
 
 
 class SteerTests(unittest.TestCase):

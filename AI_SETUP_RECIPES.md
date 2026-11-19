@@ -24,6 +24,7 @@ example.
 | `WISP_LLM_HEADERS` | One JSON object of extra request headers. Names match case-insensitively. A JSON `null` deletes a header. A value may hold `{session}` and `{key}`. | none |
 | `WISP_LLM_MODEL_INFO_FILE` | A JSON file keyed by model: `context` plus per-million `input`, `output`, `cacheRead`, `cacheWrite`. Each run copies the file into `wisp.modelcfg`. | none |
 | `WISP_LLM_STREAM` | `false`, `0`, `no` or `off` sends one non-stream call. `openai-chat` only. | stream |
+| `WISP_LLM_VISION` | `false`, `0`, `no` or `off` keeps image parts off the request wire: `load_image` still stores the image and every request sends a text placeholder in its place; `wisp run --attach` refuses at start. `true`, `1`, `yes` or `on` forces images on. Unset reads the model-info `vision` field. | model-info `vision`, else on |
 | `WISP_LLM_MAX_TURNS` | Round cap per run. | `99999` |
 | `WISP_DEGENERATE_RETRY` | Textless attempts allowed before the run fails. | `3` |
 | `WISP_SESSIONS_ROOT` | Where `wisp new` puts session dirs. | `<project root>/wisp-sessions` |
@@ -226,7 +227,9 @@ round. The copy costs one file read and no network call.
 ``` json
 {
   "gpt-5.1": {"context": 272000, "input": 1.25, "output": 10,
-              "cacheRead": 0.125, "cacheWrite": 0}
+              "cacheRead": 0.125, "cacheWrite": 0},
+  "a-text-only-model": {"context": 300000, "input": 0.03, "output": 2.15,
+              "cacheRead": 0, "cacheWrite": 0, "vision": false}
 }
 ```
 
@@ -236,6 +239,17 @@ omitting a field. A missing entry prints `<noprice>` and
 `<nocontext>`. A missing, broken or empty file warns on stderr and
 writes nothing, so a hand-written `wisp.modelcfg` survives. `~`
 expands.
+
+`vision` is the one boolean field. `false` keeps image parts off that
+model's request wire: `load_image` still stores the image, every
+request sends a text placeholder in its place, and `wisp run --attach`
+fails before the run starts. A text-only endpoint answers HTTP 400 to
+a request that carries image parts, and one such round would poison
+the session; the wire placeholder keeps the request text-only while
+the stored conversation keeps the bytes, so a later run on a
+vision-capable model replays the real image. A missing `vision` key,
+`true`, or a missing entry means images pass. Set `WISP_LLM_VISION` to
+override the table for one run.
 
 Keep one file per backend: each recipe rewrites the whole file. A
 single `models.json` works for one backend at a time.
@@ -256,7 +270,8 @@ curl -s https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_
                 input: (.value.input_cost_per_token * 1000000),
                 output: ((.value.output_cost_per_token // 0) * 1000000),
                 cacheRead: ((.value.cache_read_input_token_cost // 0) * 1000000),
-                cacheWrite: ((.value.cache_creation_input_token_cost // 0) * 1000000)})' \
+                cacheWrite: ((.value.cache_creation_input_token_cost // 0) * 1000000),
+                vision: (.value.supports_vision == true)})' \
   > "$HOME/.config/wisp/litellm.json"
 ```
 
@@ -276,7 +291,8 @@ curl -s https://openrouter.ai/api/v1/models \
           input: (($m.pricing.prompt // "0") | tonumber) * 1000000,
           output: (($m.pricing.completion // "0") | tonumber) * 1000000,
           cacheRead: (($m.pricing.input_cache_read // "0") | tonumber) * 1000000,
-          cacheWrite: (($m.pricing.input_cache_write // "0") | tonumber) * 1000000})' \
+          cacheWrite: (($m.pricing.input_cache_write // "0") | tonumber) * 1000000,
+          vision: (($m.architecture.input_modalities // []) | index("image") != null)})' \
   > "$HOME/.config/wisp/openrouter.json"
 ```
 
@@ -300,6 +316,10 @@ curl -s -H "Authorization: Bearer $OPENCODE_API_KEY" \
   > "$HOME/.config/wisp/opencode-go.json"
 ```
 
+The opencode-go table names no image flag. Add `vision` by hand for
+the models you drive through it: `"vision": false` in the entry, or
+`export WISP_LLM_VISION=false` for one run.
+
 ### Check one model
 
 The `-m` value and the table key must match byte for byte. A `missing`
@@ -307,6 +327,14 @@ answer means the file lacks that id.
 
 ``` shell
 jq -r --arg m "$MODEL" '.[$m] // "missing"' "$HOME/.config/wisp/litellm.json"
+```
+
+An entry with `"vision": false` keeps image parts off that model's
+requests; check it the same way:
+
+``` shell
+jq -r --arg m "$MODEL" '.[$m].vision // "on (no vision key)"' \
+     "$HOME/.config/wisp/litellm.json"
 ```
 
 ## Thinking and limits

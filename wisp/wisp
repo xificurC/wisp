@@ -67,11 +67,14 @@ and the user-level places.
 
 Env: WISP_SESSION_DIR, WISP_SESSIONS_ROOT, WISP_LLM_URL, WISP_LLM_API_KEY,
 WISP_LLM_MAX_TURNS, WISP_LLM_STREAM, WISP_LLM_HEADERS,
-WISP_LLM_MODEL_INFO_FILE. WISP_LLM_URL is the full request URL; wisp appends
-nothing. WISP_LLM_STREAM=false sends one non-stream chat request per turn
-and prints the whole turn as one chunk. WISP_LLM_HEADERS is one JSON object
-of extra request headers. WISP_LLM_MODEL_INFO_FILE names a JSON model table
-that wisp copies into wisp.modelcfg.
+WISP_LLM_MODEL_INFO_FILE, WISP_LLM_VISION. WISP_LLM_URL is the full request
+URL; wisp appends nothing. WISP_LLM_STREAM=false sends one non-stream chat
+request per turn and prints the whole turn as one chunk. WISP_LLM_HEADERS
+is one JSON object of extra request headers. WISP_LLM_MODEL_INFO_FILE names
+a JSON model table that wisp copies into wisp.modelcfg.
+WISP_LLM_VISION=false keeps image parts off the request wire: load_image
+still stores the image, every request sends a text placeholder in its
+place, and wisp run --attach refuses at start.
 """
 
 from __future__ import annotations
@@ -510,7 +513,8 @@ When an <environment> block opens your system prompt, its MODEL and
 THINKING lines hold the same settings. A missing THINKING line
 means the run sets no thinking; omit -t. Do not read wisp.run.json
 for them.
-wisp.modelcfg holds model entries with context size and cost data.
+wisp.modelcfg holds model entries with context size, cost data,
+and an optional vision boolean.
 
 TURN MODEL
 
@@ -822,6 +826,8 @@ def run_agent_loop(world: World, opts: Any) -> int:
     setup, records = load_session_state(world, opts)
     world.set("context_guard",
               context_guard_of(world, getattr(opts, "context_guard", None)))
+    if getattr(opts, "attach", None) and not vision_enabled_of(world):
+        fail(world, "wisp run: --attach: %s" % VISION_OFF_NOTE)
     steer_intake(world, records)
     prompt = world.get("stdin").read_text()
     if not prompt.strip():
@@ -1470,14 +1476,20 @@ def read_usage_chunks(world: World, path: str) -> dict:
 
 
 MODELCFG_FIELDS = ("context", "input", "output", "cacheRead", "cacheWrite")
-"""The per-model keys wisp.modelcfg and WISP_LLM_MODEL_INFO_FILE share."""
+"""The per-model numeric keys wisp.modelcfg and WISP_LLM_MODEL_INFO_FILE
+share."""
+MODELCFG_BOOL_FIELDS = ("vision",)
+"""The per-model boolean keys the same tables share. vision false keeps
+a model's requests text-only: the stored conversation keeps its images
+and every request sends a text placeholder in their place."""
 
 
 def model_table_ok_of(table: Any) -> bool:
     """Whether one parsed table has the wisp.modelcfg shape: a
     non-empty JSON object of JSON objects, with a number in every
-    known field it holds. An unknown extra key passes, so a wider
-    provider table still loads."""
+    known numeric field it holds and a boolean in every known boolean
+    field it holds. An unknown extra key passes, so a wider provider
+    table still loads."""
     if not isinstance(table, dict) or not table:
         return False
     for entry in table.values():
@@ -1488,6 +1500,12 @@ def model_table_ok_of(table: Any) -> bool:
             if value is None:
                 continue
             if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+        for name in MODELCFG_BOOL_FIELDS:
+            value = entry.get(name)
+            if value is None:
+                continue
+            if not isinstance(value, bool):
                 return False
     return True
 
@@ -2006,7 +2024,10 @@ def command_help_text(cmd: str) -> str:
             "read from stdin. --attach FILE, repeatable, stores one image",
             "attachment per file on the user record: PNG, JPEG, GIF,",
             "WebP; the bytes go inline as base64. A missing file or a",
-            "non-image fails before the run starts.",
+            "non-image fails before the run starts. With vision off",
+            "(WISP_LLM_VISION, or a modelcfg vision: false), --attach",
+            "fails before the run starts, and load_image still stores the",
+            "image while every request sends a text placeholder in its place.",
             "Run with -d DIR, or set WISP_SESSION_DIR. Without both, wisp run",
             "fails. The session dir must hold wisp.jsonl.",
             "Steering: `wisp steer` queues messages in",
@@ -2024,14 +2045,16 @@ def command_help_text(cmd: str) -> str:
             "wisp.modelcfg holds no context window for the model.",
             "Env: WISP_SESSION_DIR, WISP_LLM_URL, WISP_LLM_API_KEY,",
             "WISP_LLM_MAX_TURNS, WISP_LLM_STREAM, WISP_LLM_HEADERS,",
-            "WISP_LLM_MODEL_INFO_FILE.",
+            "WISP_LLM_MODEL_INFO_FILE, WISP_LLM_VISION.",
             "WISP_LLM_URL is the full request URL; wisp appends",
             "nothing. WISP_LLM_STREAM=false sends one non-stream chat",
             "request and prints the turn as one chunk.",
             "WISP_LLM_HEADERS is one JSON object of extra request",
             "headers; a value may hold {session} and {key}, and a null",
             "deletes a header. WISP_LLM_MODEL_INFO_FILE is a JSON model",
-            "table copied into wisp.modelcfg.",
+            "table copied into wisp.modelcfg. WISP_LLM_VISION=false,",
+            "or a modelcfg vision: false, keeps image parts off the wire",
+            "and keeps the stored conversation unchanged.",
         ]) + "\n",
         "continue": "\n".join([
             "wisp continue: finish an open segment without a new prompt.",
@@ -2051,14 +2074,16 @@ def command_help_text(cmd: str) -> str:
             "continue fails. The session dir must hold wisp.jsonl.",
             "Env: WISP_SESSION_DIR, WISP_LLM_URL, WISP_LLM_API_KEY,",
             "WISP_LLM_MAX_TURNS, WISP_LLM_STREAM, WISP_LLM_HEADERS,",
-            "WISP_LLM_MODEL_INFO_FILE.",
+            "WISP_LLM_MODEL_INFO_FILE, WISP_LLM_VISION.",
             "WISP_LLM_URL is the full request URL; wisp appends",
             "nothing. WISP_LLM_STREAM=false sends one non-stream chat",
             "request and prints the turn as one chunk.",
             "WISP_LLM_HEADERS is one JSON object of extra request",
             "headers; a value may hold {session} and {key}, and a null",
             "deletes a header. WISP_LLM_MODEL_INFO_FILE is a JSON model",
-            "table copied into wisp.modelcfg.",
+            "table copied into wisp.modelcfg. WISP_LLM_VISION=false,",
+            "or a modelcfg vision: false, keeps image parts off the wire",
+            "and keeps the stored conversation unchanged.",
         ]) + "\n",
         "steer": "\n".join([
             "wisp steer: queue one steering message for the session's runs.",
@@ -2779,7 +2804,9 @@ class Session:
         The caller gets the file from the provider; wisp fetches no
         model info. The file holds one JSON object keyed by model, the
         shape wisp.modelcfg already has: context plus per-million
-        input, output, cacheRead and cacheWrite. Unset means nothing
+        input, output, cacheRead and cacheWrite, and an optional
+        vision boolean that keeps one model's requests text-only
+        while the stored conversation keeps its images. Unset means nothing
         happens and nothing warns. A missing, broken, or empty file
         warns on stderr and writes nothing, so a hand-written
         wisp.modelcfg survives."""
@@ -2895,7 +2922,10 @@ class Tools:
 
         The media type comes from the file bytes. A resize failure or
         an unsupported file degrades to a text note with exit 1, so
-        the model learns why it cannot see the image.
+        the model learns why it cannot see the image. The image is
+        always stored: a request builder keeps image parts off the
+        wire when the run's endpoint takes none, so declaring a model
+        non-image repairs a poisoned session without losing bytes.
         """
         world = self._world
         path = args.get("path")
@@ -3066,6 +3096,53 @@ def stream_enabled_of(world: World) -> bool:
         return False
     fail(world, "unknown WISP_LLM_STREAM %s (leave it unset for a stream,"
          " or set false, 0, no or off)" % raw)
+
+
+VISION_ON_WORDS = ("true", "1", "yes", "on")
+"""WISP_LLM_VISION values that force image content on."""
+VISION_OFF_WORDS = ("false", "0", "no", "off")
+"""WISP_LLM_VISION values that force image content off."""
+
+VISION_OFF_NOTE = ("the endpoint of this run takes no image content;"
+                   " inspect the file with bash or python3 instead")
+"""The one wording every vision-off refusal carries: the load_image
+tool result and the wisp run --attach start check."""
+
+
+def vision_enabled_of(world: World) -> bool:
+    """Whether this run's endpoint takes image content.
+
+    Off keeps image parts off every request wire. The stored
+    conversation keeps its attachments, so a later run with vision on
+    replays the bytes with no repair step. WISP_LLM_VISION wins
+    first: unset or empty keeps the table
+    default, true, 1, yes and on force vision on, false, 0, no and
+    off force it off, and any other value fails, so a typo never
+    changes the wire. Without the env value, the model's wisp.modelcfg
+    entry may carry "vision": false. Anything else - a true entry, a
+    missing entry, a broken file - defaults to on, so vision models
+    keep working with no config."""
+    try:
+        env = world.get("env")
+    except KeyError:
+        env = {}
+    raw = (env.get("WISP_LLM_VISION") or "").strip().lower()
+    if raw:
+        if raw in VISION_ON_WORDS:
+            return True
+        if raw in VISION_OFF_WORDS:
+            return False
+        fail(world, "unknown WISP_LLM_VISION %s (leave it unset, or set"
+             " true, 1, yes, on, false, 0, no or off)" % raw)
+    try:
+        sessiondir = world.get("sessiondir")
+        model = world.get("model")
+    except KeyError:
+        return True
+    cfg = read_model_cfg(world, sessiondir + "/wisp.modelcfg", model)
+    if cfg is not None and cfg.get("vision") is False:
+        return False
+    return True
 
 
 def session_key_of(world: World) -> str:
@@ -3532,13 +3609,53 @@ def tool_text_of(rec: dict, budget: tuple = ()) -> str:
     line = " ".join(parts)
     return line + "\n" + content if content else line
 
-def message_of(rec: dict) -> dict:
+IMAGE_PART_TYPES = ("image_url", "input_image", "image")
+"""The content-part types that carry image bytes: openai-chat,
+openai-responses and anthropic."""
+
+IMAGE_OMITTED_TEXT = "(image omitted: model does not support images)"
+"""The text that stands in for a user record's image part when this
+run's endpoint takes no image content."""
+
+TOOL_IMAGE_OMITTED_TEXT = ("(tool image omitted: model does not"
+                           " support images)")
+"""The text that stands in for a tool record's image part when this
+run's endpoint takes no image content."""
+
+
+def text_only_parts(parts: list, text_type: str, note: str,
+                    vision: bool) -> list:
+    """Keep image parts off the wire when this run's endpoint takes none.
+
+    Vision on returns parts unchanged, so the stored bytes go out.
+    Vision off replaces each image part - openai-chat image_url,
+    responses input_image, anthropic image - with one text part
+    carrying note, so the request stays text-only while the stored
+    record keeps its attachments: a later run on a vision-capable
+    model replays the bytes with no repair step. text_type names the
+    provider's text part: "text", or "input_text" for the responses
+    API. No part is mutated, so the record on disk is untouched."""
+    if vision:
+        return parts
+    out = []
+    for part in parts:
+        if part.get("type") in IMAGE_PART_TYPES:
+            out.append({"type": text_type, "text": note})
+        else:
+            out.append(part)
+    return out
+
+
+def message_of(rec: dict, vision: bool = True) -> dict:
     """Map one stored record to its wire message.
 
     text blocks join into content, reasoning blocks join into
     reasoning_content (replayed, not stripped, so the cache prefix
     hits), tool_call blocks keep their block order as tool_calls
-    entries. Key order is stable across fresh and resumed runs.
+    entries. Key order is stable across fresh and resumed runs. A
+    user record with attachments carries one text part and one image
+    part per attachment; vision off turns each image part into
+    IMAGE_OMITTED_TEXT.
     """
     kind = rec["type"]
     if kind == "assistant":
@@ -3563,11 +3680,13 @@ def message_of(rec: dict) -> dict:
         for att in rec["attachments"]:
             parts.append({"type": "image_url",
                           "image_url": {"url": data_uri_of(att)}})
-        return {"role": "user", "content": parts}
+        return {"role": "user",
+                "content": text_only_parts(parts, "text",
+                                           IMAGE_OMITTED_TEXT, vision)}
     return {"role": kind, "content": rec["content"]}
 
 
-def items_of_responses(rec: dict) -> list:
+def items_of_responses(rec: dict, vision: bool = True) -> list:
     """Map one stored record to openai-responses input items.
 
     A system record stays a developer message item. A user record is
@@ -3580,6 +3699,9 @@ def items_of_responses(rec: dict) -> list:
     is stable, so the serialized item list stays byte-stable across
     fresh and resumed runs. An unsigned reasoning item still replays
     its summary text; the Responses API does not require the blob.
+    Vision off turns each image part into a placeholder text part:
+    IMAGE_OMITTED_TEXT on a user record, TOOL_IMAGE_OMITTED_TEXT on
+    a tool record.
     """
     kind = rec["type"]
     if kind == "system":
@@ -3590,7 +3712,9 @@ def items_of_responses(rec: dict) -> list:
         for att in rec.get("attachments") or []:
             parts.append({"type": "input_image",
                           "image_url": data_uri_of(att)})
-        return [{"role": "user", "content": parts}]
+        return [{"role": "user",
+                 "content": text_only_parts(parts, "input_text",
+                                            IMAGE_OMITTED_TEXT, vision)}]
     if kind == "assistant":
         out = []
         for b in rec["output"]:
@@ -3617,13 +3741,16 @@ def items_of_responses(rec: dict) -> list:
                 parts.append({"type": "input_image",
                               "image_url": data_uri_of(att)})
             return [{"type": "function_call_output",
-                     "call_id": rec["call_id"], "output": parts}]
+                     "call_id": rec["call_id"],
+                     "output": text_only_parts(parts, "input_text",
+                                               TOOL_IMAGE_OMITTED_TEXT,
+                                               vision)}]
         return [{"type": "function_call_output", "call_id": rec["call_id"],
                  "output": text}]
     return []
 
 
-def items_of_anthropic(rec: dict) -> list:
+def items_of_anthropic(rec: dict, vision: bool = True) -> list:
     """Map one stored record to anthropic messages items.
 
     A system record maps to nothing here; anthropic_system_text lifts
@@ -3637,7 +3764,9 @@ def items_of_anthropic(rec: dict) -> list:
     pass the signature check, and dropping from the run start is the
     legal removal. A tool record is one user message with one
     tool_result block. Key order is stable, so the serialized body
-    stays byte-stable.
+    stays byte-stable. Vision off turns each image part into a
+    placeholder text part: IMAGE_OMITTED_TEXT on a user record,
+    TOOL_IMAGE_OMITTED_TEXT on a tool record.
     """
     kind = rec["type"]
     if kind == "system":
@@ -3648,7 +3777,9 @@ def items_of_anthropic(rec: dict) -> list:
             content.append({"type": "image", "source": {
                 "type": "base64", "media_type": att["media_type"],
                 "data": att["data"]}})
-        return [{"role": "user", "content": content}]
+        return [{"role": "user",
+                 "content": text_only_parts(content, "text",
+                                            IMAGE_OMITTED_TEXT, vision)}]
     if kind == "assistant":
         content = []
         for b in rec["output"]:
@@ -3678,7 +3809,9 @@ def items_of_anthropic(rec: dict) -> list:
                     "data": att["data"]}})
             return [{"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": rec["call_id"],
-                 "content": content}]}]
+                 "content": text_only_parts(content, "text",
+                                            TOOL_IMAGE_OMITTED_TEXT,
+                                            vision)}]}]
         return [{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": rec["call_id"],
              "content": text}]}]
@@ -3696,8 +3829,11 @@ def body_of_chat(world: World, records: list) -> dict:
     The steer tag applies to user text before message_of builds the
     message - the same pre-mapper surgery the other builders do - so
     a user record with attachments carries them in its text part and
-    the image parts pass through. For text-only records the strings
-    are byte-identical to the old post-mapper surgery."""
+    the image parts pass through. Vision off turns every image part
+    into a placeholder before it reaches the body. For text-only
+    records the strings are byte-identical to the old post-mapper
+    surgery."""
+    vision = vision_enabled_of(world)
     messages = []
     pending_images = []
     for rec in records:
@@ -3706,15 +3842,15 @@ def body_of_chat(world: World, records: list) -> dict:
             wire_rec = dict(wire_rec)
             wire_rec["content"] = user_text_of(wire_rec)
         if rec.get("type") == "tool":
-            messages.append(message_of(wire_rec))
+            messages.append(message_of(wire_rec, vision))
             pending_images.extend(rec.get("attachments") or [])
             continue
         if pending_images:
-            messages.append(chat_image_message(pending_images))
+            messages.append(chat_image_message(pending_images, vision))
             pending_images = []
-        messages.append(message_of(wire_rec))
+        messages.append(message_of(wire_rec, vision))
     if pending_images:
-        messages.append(chat_image_message(pending_images))
+        messages.append(chat_image_message(pending_images, vision))
     body = {
         "model": world.get("model"),
         "messages": messages,
@@ -3732,19 +3868,22 @@ def body_of_chat(world: World, records: list) -> dict:
     return body
 
 
-def chat_image_message(attachments: list) -> dict:
+def chat_image_message(attachments: list, vision: bool = True) -> dict:
     """One user message that carries tool-result images.
 
     The openai-chat tool message takes text only, so the images go in
     one user message after the run of tool messages. The layer builds
-    it at serialization time; no such record is ever stored.
+    it at serialization time; no such record is ever stored. Vision
+    off turns each image part into TOOL_IMAGE_OMITTED_TEXT.
     """
     content = [{"type": "text",
                 "text": "Attached image(s) from tool result:"}]
     for att in attachments:
         content.append({"type": "image_url",
                         "image_url": {"url": data_uri_of(att)}})
-    return {"role": "user", "content": content}
+    return {"role": "user",
+            "content": text_only_parts(content, "text",
+                                       TOOL_IMAGE_OMITTED_TEXT, vision)}
 
 
 def user_text_of(rec: dict) -> str:
@@ -3769,6 +3908,7 @@ def body_of_responses(world: World, records: list) -> dict:
     session id, the routing hint the vendor documents for the prefix
     cache.
     """
+    vision = vision_enabled_of(world)
     input_items = []
     instructions = ""
     for rec in records:
@@ -3781,7 +3921,7 @@ def body_of_responses(world: World, records: list) -> dict:
         if kind == "user":
             wire_rec = dict(rec)
             wire_rec["content"] = user_text_of(rec)
-        input_items.extend(items_of_responses(wire_rec))
+        input_items.extend(items_of_responses(wire_rec, vision))
     body = {
         "model": world.get("model"),
         "input": input_items,
@@ -3816,6 +3956,7 @@ def body_of_anthropic(world: World, records: list) -> dict:
     depth and no budget_tokens enters the body. Only fields the
     messages API names are ever set.
     """
+    vision = vision_enabled_of(world)
     messages = []
     system = ""
     owner = []  # message index -> source record index
@@ -3830,7 +3971,7 @@ def body_of_anthropic(world: World, records: list) -> dict:
             wire_rec = dict(rec)
             wire_rec["content"] = user_text_of(rec)
         before = len(messages)
-        messages.extend(items_of_anthropic(wire_rec))
+        messages.extend(items_of_anthropic(wire_rec, vision))
         owner.extend([ri] * (len(messages) - before))
     body = {
         "model": world.get("model"),

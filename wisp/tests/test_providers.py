@@ -91,6 +91,9 @@ class _Fs:
     def append_text(self, path, text):
         pass
 
+    def exists(self, path):
+        return False
+
 
 class _Clock:
     def ms(self):

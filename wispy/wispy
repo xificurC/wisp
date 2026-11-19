@@ -3,6 +3,7 @@
 
   wispy run      [--skills LIST] [flags]          < request
   wispy continue [--skills LIST] [flags]         [< request]
+  wispy demote   [flags]                         [< reason]
   wispy steer                                    < message
   wispy commit   [--skills LIST] [--close] [flags]  [< brief]
   wispy response
@@ -27,6 +28,17 @@ the run sets it back to wip.
 continue finishes the open phase that .phase names. With no text on
 stdin it runs `wisp continue`. With text it runs `wisp run`, and the
 text becomes the <request> of that turn. No marker exits 2.
+
+demote is the generic recovery for a session no request can replay.
+It demotes the session named by .phase (work or distill, never
+commit): the response is saved, the session dir is recorded, the
+marker is cleared, and a fresh work session starts with the same
+skills. Its first turn carries a recovery note that names the demoted
+session; an optional reason arrives on stdin. Use it when wispy
+continue keeps failing on the same session: an endpoint that rejects
+the stored conversation, or a run that dies another way every time.
+The demoted transcript stays readable on disk; it is just never
+replayed.
 
 steer sends the whole stdin text to the session named by .phase. No
 marker exits 2, and an unfinished commit exits 2. It sends no message
@@ -437,9 +449,13 @@ def decide_after_work(rc: int, interrupted: bool,
     ('sigint', 0)      the user stopped it: save, keep work, exit 130
     ('stop', 0)        distill with STOP, exit 0
     ('loop', 0)        distill with LOOP, start the next session
-    ('api', 0)         exit 1, keep work
+    ('api', 0)         exit 1, keep work; rc 1 and rc 77
     ('stop', rc)       distill with STOP, exit rc
     ('abandon', rc)    no finished round: record, clear, exit rc
+
+    rc 77 is one http error. A distill in the same session would
+    replay the same request and die the same way, so the work stays
+    and wispy demote is the escape.
     """
     if interrupted:
         return ("sigint", 0)
@@ -447,7 +463,7 @@ def decide_after_work(rc: int, interrupted: bool,
         return ("stop", 0)
     if rc == 75:
         return ("loop", 0)
-    if rc == 1:
+    if rc in (1, 77):
         return ("api", 0)
     if has_work:
         return ("stop", rc)
@@ -876,6 +892,8 @@ def distill(world: World, ticket: Ticket, session: str, seq: str,
     if rc != 0:
         note(world, "distill exited %d; the ticket may be partial" % rc)
         note(world, "repair: wispy continue retries the distill")
+        note(world, "repair: wispy demote replaces session %s with a"
+                    " fresh one" % session)
         return rc
     if sessions.assistant_count(session) <= before:
         note(world, "distill gave no output; the marker stays")
@@ -976,6 +994,8 @@ def drive(world: World, opts: Any, ticket: Ticket, session: str, seq: str,
         if action == "api":
             note(world, "API error in the work run")
             note(world, "repair: wispy continue resumes session %s" % session)
+            note(world, "repair: wispy demote replaces session %s with a"
+                        " fresh one" % session)
             return 1
         if action == "abandon":
             record_session(world, ticket, session)
@@ -1054,6 +1074,56 @@ def cmd_continue(world: World, opts: Any) -> int:
                        " run wispy commit" % ticket.id)
     return resume(world, opts, ticket, phase, read_stdin_text(world),
                   "continue")
+
+
+def demote_turn(phase: Phase, reason: str) -> str:
+    """The first turn of the successor session a demote starts."""
+    lines = [
+        "The previous work session %s was demoted: wispy opened this"
+        " fresh session because no wisp request could replay that"
+        " conversation." % phase.session,
+        "The work it finished lives on disk and in the ticket record;"
+        " its transcript stays readable at %s/wisp.jsonl." % phase.session,
+        "Reason: %s." % (reason.strip() or "not given; every retry on the"
+                         " session kept failing"),
+        "Continue the work from STATE.md and the ticket tasks; read the"
+        " demoted transcript only when a fact is missing.",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_demote(world: World, opts: Any) -> int:
+    """Demote the open phase's session and start a fresh work session.
+
+    The repair for a session no request can replay: the endpoint
+    rejects its conversation (image content a text-only model refuses,
+    a poison record of any kind), or the run keeps dying another way.
+    The demoted session keeps its record: its response is saved, its
+    dir is listed in sessions.txt, its transcript stays on disk. The
+    successor session starts with the same skills and a recovery note
+    that names the demoted session. An optional reason arrives on
+    stdin. A commit phase is refused: wispy commit owns that repair.
+    """
+    ticket = world.get("ticket").open()
+    phase = read_phase(world, ticket)
+    if phase is None:
+        fail(world, 2, "ticket %s has no open session; use wispy run"
+                       % ticket.id)
+    if phase.kind == "commit":
+        fail(world, 2, "ticket %s has an unfinished commit; run wispy"
+                       " commit" % ticket.id)
+    reason = read_steering(world)
+    skills = read_skills(world, ticket, phase.seq)
+    save_response(world, ticket, phase.session, phase.seq)
+    record_session(world, ticket, phase.session)
+    clear_phase(world, ticket)
+    note(world, "session %s demoted; no later request replays its"
+                " conversation" % phase.session)
+    seq, session = start_session(world, opts, ticket, skills)
+    note(world, "successor work session %s-%s" % (ticket.id, seq))
+    request = demote_turn(phase, reason)
+    return drive(world, opts, ticket, session, seq, request, skills,
+                 "run", 1)
 
 
 def cmd_steer(world: World, opts: Any) -> int:
@@ -1301,6 +1371,7 @@ class Opts:
 COMMANDS: dict = {
     "run": cmd_run,
     "continue": cmd_continue,
+    "demote": cmd_demote,
     "steer": cmd_steer,
     "commit": cmd_commit,
     "response": cmd_response,
@@ -1362,7 +1433,8 @@ def parse_args(world: World, argv: list) -> Opts | None:
             fail(world, 2, "unknown flag: %s" % arg)
         fail(world, 2, "wispy takes no positional argument;"
                        " set WISPY_TICKET")
-    if opts.command in ("run", "continue", "commit") and not opts.model:
+    if opts.command in ("run", "continue", "demote", "commit") \
+            and not opts.model:
         fail(world, 2, "set --model or WISPY_MODEL")
     if opts.guard < 1 or opts.guard > 100:
         fail(world, 2, "--guard needs a percent from 1 to 100")
