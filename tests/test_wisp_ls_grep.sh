@@ -80,7 +80,7 @@ check "case 1: line format" \
 # --- case 2: project scope rejects -d ------------------------------
 
 OUT="$("$WISP" ls -d "$ROOT/new" 2>"$TESTDIR/e2")"; RC=$?
-check "case 2: -d without --tree fails" "$RC" "1"
+check "case 2: -d without --tree fails" "$RC" "2"
 check "case 2: one stderr line" "$(wc -l <"$TESTDIR/e2")" "1"
 check "case 2: stderr names -d" "$(matches 'works only with --tree' "$(cat "$TESTDIR/e2")")" "1"
 
@@ -176,7 +176,7 @@ check "case 10: no stderr" "$(wc -l <"$TESTDIR/e10")" "0"
 # --- case 11: --tree without -d and WISP_SESSION_DIR fails ---------------
 
 OUT="$("$WISP" ls --tree 2>"$TESTDIR/e11")"; RC=$?
-check "case 11: fails" "$RC" "1"
+check "case 11: fails" "$RC" "2"
 check "case 11: one stderr line" "$(wc -l <"$TESTDIR/e11")" "1"
 check "case 11: resolve_rundir message shape" \
     "$(matches 'pass -d DIR, or set WISP_SESSION_DIR' "$(cat "$TESTDIR/e11")")" "1"
@@ -184,7 +184,7 @@ check "case 11: resolve_rundir message shape" \
 # --- case 12: --global --tree together fails -------------------------
 
 OUT="$("$WISP" ls --global --tree -d "$TR/p" 2>"$TESTDIR/e12")"; RC=$?
-check "case 12: fails" "$RC" "1"
+check "case 12: fails" "$RC" "2"
 check "case 12: one stderr line" "$(wc -l <"$TESTDIR/e12")" "1"
 
 # --- case 13: grep finds a user match in all three scopes ------------
@@ -247,12 +247,12 @@ check "case 18: stderr names the pattern" \
 # --- accepted extras: strict parsing, read-only corpus discipline -----------
 
 OUT="$("$WISP" ls -i 2>"$TESTDIR/x1")"; RC=$?
-check "ls -i rejected (P2)" "$RC" "1"
+check "ls -i rejected (P2)" "$RC" "2"
 check "ls -i: one stderr line" "$(wc -l <"$TESTDIR/x1")" "1"
-check "grep without PATTERN rejected" "$("$WISP" grep >/dev/null 2>&1; echo $?)" "1"
-check "ls with a positional rejected" "$("$WISP" ls extra >/dev/null 2>&1; echo $?)" "1"
-check "grep --tree without session dir rejected" "$("$WISP" grep --tree x >/dev/null 2>&1; echo $?)" "1"
-check "-d needs a value" "$("$WISP" ls --tree -d >/dev/null 2>&1; echo $?)" "1"
+check "grep without PATTERN rejected" "$("$WISP" grep >/dev/null 2>&1; echo $?)" "2"
+check "ls with a positional rejected" "$("$WISP" ls extra >/dev/null 2>&1; echo $?)" "2"
+check "grep --tree without session dir rejected" "$("$WISP" grep --tree x >/dev/null 2>&1; echo $?)" "2"
+check "-d needs a value" "$("$WISP" ls --tree -d >/dev/null 2>&1; echo $?)" "2"
 
 # --- piped out: the reader closes the pipe ----------------------------------
 

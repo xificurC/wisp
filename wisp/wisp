@@ -2,8 +2,10 @@
 """wisp - minimal single-file agent harness, python3 standard library only.
 
   wisp new --name NAME -m MODEL [-t THINKING] [-s SYSFILE]
-           [--env-in-system-prompt] [--parent DIR]   # child sessions: give it always
-  wisp run [-d DIR] < prompt
+           [-d PARENT] [--env-in-system-prompt] [--parent DIR]
+  wisp fork -d SRC [-o DST] [-m MODEL] [-t THINKING]
+  wisp run [-d DIR] [--no-stream] [--wallclock S] < prompt
+  wisp status -d DIR [--json]
   wisp steer [-d DIR] < message
   wisp continue [-d DIR]
   wisp response [-d DIR]
@@ -82,16 +84,19 @@ from __future__ import annotations
 import base64
 import codecs
 import contextlib
+import fcntl
 import io
 import json
 import os
 import select
+import shutil
 import signal
 import random
 import re
 import string
 import subprocess
 import sys
+import threading
 import traceback
 import time
 import urllib.error
@@ -154,10 +159,205 @@ class StdinFile:
         return self._stream.isatty()
 
 
-def fail(world: World, message: str) -> None:
-    """Print one stderr error line and exit 1."""
-    world.get("stderr").write("wisp: %s\n" % message)
-    raise SystemExit(1)
+def fail(world: World, message: str, code: int | None = None,
+         kind: str | None = None, **fields: Any) -> None:
+    """Print one machine line on stderr and exit with the table's code.
+
+    The line carries a kind and the optional http facts, so a caller
+    parses one line instead of prose. During argument parsing the code
+    is 2 (usage); everywhere else it is 1 unless the caller names the
+    engine signal: 75 guard, 76 busy, 77 http, 78 nothing, 79
+    degenerate, 124 wall clock."""
+    if code is None:
+        code = 2 if _phase_of(world) == "parse" else 1
+    if kind is None:
+        kind = "usage" if code == 2 else "internal"
+    parts = ["wisp: error", "kind=%s" % kind]
+    for name in ("status", "retry_after"):
+        if fields.get(name) is not None:
+            parts.append("%s=%s" % (name, fields[name]))
+    line = " ".join(parts) + " " + message
+    world.get("stderr").write(line + "\n")
+    logged = ["kind=%s" % kind, "code=%s" % code]
+    for name in ("status", "retry_after"):
+        if fields.get(name) is not None:
+            logged.append("%s=%s" % (name, fields[name]))
+    safe_log(world, "error", *(logged + [message]))
+    raise SystemExit(code)
+
+
+def _phase_of(world: World) -> str:
+    """parse or run: set by main, never by a command."""
+    try:
+        return world.get("phase")
+    except KeyError:
+        return "run"
+
+
+def now_iso() -> str:
+    """One ISO-8601 timestamp with seconds precision and an offset."""
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+class NullWriter:
+    """A writer that drops every byte: the --no-stream sink."""
+
+    def write(self, text: str) -> None:
+        pass
+
+
+def event_out(world: World) -> Any:
+    """The stream destination: stdout, or the sink under --no-stream."""
+    try:
+        quiet = world.get("no_stream")
+    except KeyError:
+        quiet = False
+    if quiet:
+        return NullWriter()
+    return world.get("stdout")
+
+
+@contextlib.contextmanager
+def file_lock(path: str):
+    """One exclusive flock around a read-modify-write of one file.
+
+    Both writers of the steer inbox take this lock: `wisp steer` around
+    the append, and the run's intake around the rename, the read, and
+    the remove. Without it an append that lands after the rename goes
+    into the consumed file and is lost."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+RUN_LOCK = "wisp.run.lock"
+_HELD_LOCKS: list[int] = []
+
+
+def _open_lock(path: str) -> int:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+
+
+def acquire_run_lock(world: World, sessiondir: str,
+                     blocking: bool = True, write: bool = True,
+                     shared: bool = False) -> int | None:
+    """One flock on <dir>/wisp.run.lock; None when a run holds it.
+
+    The file holds the holder's pid and start time. The held flock is
+    the liveness fact; the content is the hint that names the holder."""
+    path = os.path.join(sessiondir, RUN_LOCK)
+    fd = _open_lock(path)
+    flags = ((fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+             | (0 if blocking else fcntl.LOCK_NB))
+    try:
+        fcntl.flock(fd, flags)
+    except OSError:
+        os.close(fd)
+        return None
+    if write:
+        os.ftruncate(fd, 0)
+        os.write(fd, (json.dumps(
+            {"pid": os.getpid(), "start": now_iso()}) + "\n").encode())
+    _HELD_LOCKS.append(fd)
+    return fd
+
+
+def release_run_lock(fd: int | None) -> None:
+    """Release one lock acquired by acquire_run_lock."""
+    if fd is None:
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+        if fd in _HELD_LOCKS:
+            _HELD_LOCKS.remove(fd)
+
+
+def lock_holder_of(sessiondir: str) -> dict | None:
+    """The run lock's holder hint, or None when the lock is free."""
+    path = os.path.join(sessiondir, RUN_LOCK)
+    if not os.path.exists(path):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            holder = None
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                raw = os.read(fd, 4096).decode("utf-8", "replace").strip()
+                holder = json.loads(raw) if raw else None
+            except (OSError, ValueError):
+                holder = None
+            return holder if isinstance(holder, dict) else {}
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return None
+    finally:
+        os.close(fd)
+
+
+def require_run_lock(world: World, sessiondir: str) -> int:
+    """Take the run lock for the life of a run; exit 76 when busy."""
+    fd = acquire_run_lock(world, sessiondir, blocking=False)
+    if fd is None:
+        holder = lock_holder_of(sessiondir) or {}
+        fail(world, "run lock busy in %s (pid=%s start=%s)"
+             % (sessiondir, holder.get("pid", "?"),
+                holder.get("start", "?")),
+             code=76, kind="busy")
+    return fd
+
+
+class WallclockExit(Exception):
+    """The --wallclock limit fired."""
+
+    def __init__(self, seconds: int):
+        super().__init__(seconds)
+        self.seconds = seconds
+
+
+def install_wallclock(world: World, seconds: int | None) -> threading.Timer | None:
+    """Arm the wall clock: SIGALRM raises WallclockExit, and a timer
+    SIGKILLs the process five seconds later so an uninterruptible call
+    cannot outlive the limit."""
+    if not seconds:
+        return None
+    def raise_wallclock(signum: int, frame: Any) -> None:
+        raise WallclockExit(seconds)
+    try:
+        signal.signal(signal.SIGALRM, raise_wallclock)
+        signal.setitimer(signal.ITIMER_REAL, float(seconds))
+    except (ValueError, OSError):
+        return None
+    killer = threading.Timer(
+        float(seconds) + 5.0,
+        lambda: os.kill(os.getpid(), signal.SIGKILL))
+    killer.daemon = True
+    killer.start()
+    return killer
+
+
+def cancel_wallclock(killer: threading.Timer | None) -> None:
+    """Disarm the wall clock and its killer timer."""
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+    except (ValueError, OSError):
+        pass
+    if killer is not None:
+        killer.cancel()
 
 
 SECRET_QUERY_WORDS = ("key", "token", "secret")
@@ -199,6 +399,7 @@ def safe_log(world: World, event: str, *fields: str) -> None:
 
 DEFAULT_MAX_TURNS = 99999
 DEGENERATE_ATTEMPTS = 3     # textless attempts allowed before the run fails
+DEFAULT_WALLCLOCK = 24 * 60 * 60
 RETRY_NUDGE = "Continue where you left off"
 """The user message a textless attempt earns before the next try.
 
@@ -214,38 +415,75 @@ DEFAULT_THINK_FIELDS = "reasoning_content,reasoning,thought"
 
 # --- command handlers ---------------------------------------------------------
 
+def destination_root(world: World, opts: Any) -> str:
+    """The directory that holds a new session: -d DIR, else the root.
+
+    `-d` on `new` names a destination root, not an existing session, so
+    it never goes through resolve_sessiondir's validator. Missing
+    parents are created; an ember type dir lives under
+    <space>/agent-types, which usually does not exist yet."""
+    raw = getattr(opts, "sessiondir", None)
+    if not raw:
+        return sessions_root(world)
+    root = os.path.abspath(raw)
+    world.get("fs").mkdir(root)
+    return root
+
+
+def system_record_of(world: World, opts: Any) -> dict:
+    """The first system record for `new -s`.
+
+    A file that parses as one JSON object with type system IS the
+    record: build-system-prompt --record emits exactly that, marker
+    included. Any other bytes are a plain persona. The legacy
+    --env-in-system-prompt flag sets the marker on either shape, so an
+    older type command keeps working; the marker, never baked text,
+    decides whether a request renders <environment>."""
+    fs = world.get("fs")
+    text = fs.read_text(opts.sysfile)
+    record = None
+    try:
+        value = json.loads(text)
+    except ValueError:
+        value = None
+    if (isinstance(value, dict) and value.get("type") == "system"
+            and isinstance(value.get("content"), str)):
+        record = {"type": "system", "content": value["content"].rstrip("\n")}
+        if value.get("include_env"):
+            record["include_env"] = True
+    else:
+        record = {"type": "system", "content": text.rstrip("\n")}
+    if getattr(opts, "env_in_system_prompt", False):
+        record["include_env"] = True
+    return record
+
+
 def new_session(world: World, opts: Any) -> int:
-    """Create the session dir under the sessions root: the --name, else a
-    rand8. Capture the run setup on disk: model and thinking into
-    wisp.run.json, the system record as the first wisp.jsonl entry when
-    -s is given. Fails on an existing session dir. Prints the full path.
-    With --parent DIR, the validated real parent path lands in the
-    child's wisp.run.json through the setup write, and the child id
-    lands in the parent's children list through link_child."""
+    """Create the session dir under -d DIR, else the sessions root.
+
+    The leaf is --name, else a rand8, and -d DIR is the parent; DIR is
+    created with its parents. The run setup records the model, the
+    thinking, the parent link, the creation time and the project dir.
+    `-s` writes the first system record; the <environment> block is
+    NEVER baked, because it is rendered at request time from this
+    setup and -d (W13). Fails on an existing session dir. Prints the
+    full path."""
     name = opts.name or world.get("rng").token(8)
-    path = os.path.join(sessions_root(world), name)
+    root = destination_root(world, opts)
+    path = os.path.join(root, name)
     if world.get("fs").exists(path):
         fail(world, "session dir already exists: %s" % path)
     parent_path = (validate_parent_dir(world, opts.parent)
                    if opts.parent else None)
     world.get("fs").mkdir(path)
-    register_sessions_root(world, sessions_root(world))
+    register_sessions_root(world, root)
     session = world.get("session")
-    session.write_run_setup(path, opts.model, opts.thinking,
-                            parent=parent_path)
-    system_text = None
-    if opts.sysfile:
-        system_text = world.get("fs").read_text(opts.sysfile)
-        if opts.env_in_system_prompt:
-            system_text = (environment_block(
-                session_dir=os.path.abspath(path),
-                sessions_root=os.path.abspath(sessions_root(world)),
-                project_dir=git_root(world) or world.get("fs").cwd(),
-                created=datetime.now().astimezone().isoformat(
-                    timespec="seconds"),
-                model=opts.model, thinking=opts.thinking or "")
-                + "\n\n" + system_text)
-    session.write_initial_log(path, system_text)
+    session.write_run_setup(
+        path, opts.model, opts.thinking, parent=parent_path,
+        created=now_iso(),
+        project_dir=git_root(world) or world.get("fs").cwd())
+    system_record = system_record_of(world, opts) if opts.sysfile else None
+    session.write_initial_log(path, system_record)
     if parent_path:
         link_child(world, parent_path, name)
     world.get("stdout").write(path + "\n")
@@ -443,6 +681,89 @@ def environment_block(session_dir: str, sessions_root: str, project_dir: str,
     if not thinking:
         lines = [line for line in lines if not line.startswith("THINKING:")]
     return xml_block("environment", None, "\n".join(lines))
+
+
+ENVIRONMENT_TAG_RE = re.compile(
+    r"\A\s*<environment>.*?</environment>\s*", re.S)
+"""The legacy baked block. W13 strips it and renders a fresh one."""
+
+
+def created_of(world: World, setup: dict, session_dir: str,
+               persist: bool = True) -> str:
+    """The session creation time: wisp.run.json, else its mtime, once.
+
+    Old sessions have no created field because the time existed only in
+    the baked prose. The setup file's mtime is the closest surviving
+    fact. It is written into wisp.run.json on the first read, because
+    link_child rewrites that file and would otherwise move the mtime and
+    change the rendered block mid-session."""
+    created = setup.get("created")
+    if isinstance(created, str) and created:
+        return created
+    fs = world.get("fs")
+    path = os.path.join(session_dir, "wisp.run.json")
+    try:
+        created = datetime.fromtimestamp(fs.mtime(path)).astimezone(
+        ).isoformat(timespec="seconds")
+    except OSError:
+        created = now_iso()
+    if persist:
+        try:
+            value = json.loads(fs.read_text(path))
+            if isinstance(value, dict) and not value.get("created"):
+                value["created"] = created
+                fs.replace_text(path,
+                                json.dumps(value, sort_keys=True) + "\n")
+        except (OSError, ValueError):
+            pass
+    setup["created"] = created
+    return created
+
+
+def system_text_of(world: World, rec: dict) -> str:
+    """One stored system record's text as this request sends it.
+
+    The <environment> block is a view (W13): a record that carries the
+    include_env marker, or a legacy record that still begins with a
+    baked block, renders a fresh block from wisp.run.json and -d. The
+    block precedes the persona. Every request builder calls this, so
+    the wire text, the rendered past, and a fork agree."""
+    content = rec.get("content") or ""
+    marked = bool(rec.get("include_env"))
+    legacy = ENVIRONMENT_TAG_RE.match(content) is not None
+    if not (marked or legacy):
+        return content
+    if legacy:
+        content = ENVIRONMENT_TAG_RE.sub("", content, count=1)
+    session_dir = os.path.abspath(world.get("sessiondir") or ".")
+    try:
+        setup = world.get("setup")
+    except KeyError:
+        setup = {}
+    if not isinstance(setup, dict):
+        setup = {}
+    try:
+        model = world.get("model")
+    except KeyError:
+        model = setup.get("model") or ""
+    try:
+        thinking = world.get("thinking")
+    except KeyError:
+        thinking = setup.get("thinking")
+    try:
+        read_only = bool(world.get("read_only"))
+    except KeyError:
+        read_only = False
+    block = environment_block(
+        session_dir=session_dir,
+        sessions_root=os.path.dirname(session_dir) or session_dir,
+        project_dir=(setup.get("project_dir")
+                     or world.get("fs").cwd()),
+        created=created_of(world, setup, session_dir,
+                           persist=not read_only),
+        model=model or "",
+        thinking=thinking or "")
+    return (block + "\n\n" + content).strip("\n")
 
 
 def skills_preamble() -> str:
@@ -695,7 +1016,13 @@ def build_system_prompt(world: World, opts: Any) -> int:
         blocks.append(xml_block("stdin", None, inline))
     if not blocks:
         return 0
-    world.get("stdout").write("\n\n".join(blocks) + "\n")
+    text = "\n\n".join(blocks) + "\n"
+    if opts.record:
+        record = {"type": "system", "content": text.rstrip("\n")}
+        if opts.include_env:
+            record["include_env"] = True
+        text = json.dumps(record, ensure_ascii=False) + "\n"
+    world.get("stdout").write(text)
     return 0
 
 
@@ -774,6 +1101,7 @@ def load_session_state(world: World, opts: Any) -> tuple:
     runs."""
     world.set("sessiondir", opts.sessiondir)
     setup = world.get("session").load_run_setup(opts.sessiondir)
+    world.set("setup", setup)
     world.set("model", setup["model"])
     world.set("thinking", setup.get("thinking"))
     check_request_of(world)
@@ -807,6 +1135,13 @@ def run_prepared(world: World, records: list, setup: dict) -> int:
         except ContextGuardExit as exc:
             guard_stop_line(world, exc)
             return GUARD_EXIT
+        except WallclockExit as exc:
+            world.get("stderr").write(
+                "wisp: error kind=wallclock limit=%ss committed"
+                " wisp.jsonl; exit 124\n" % exc.seconds)
+            safe_log(world, "error", "kind=wallclock", "code=124",
+                     "limit=%ss" % exc.seconds)
+            return 124
     finally:
         flush_records(world, records)
         warn_undelivered_steer(world)
@@ -823,21 +1158,30 @@ def run_agent_loop(world: World, opts: Any) -> int:
     inbox an earlier run left behind drains
     first - steer_intake - so its messages join the conversation as
     steered user records before the new prompt."""
-    setup, records = load_session_state(world, opts)
-    world.set("context_guard",
-              context_guard_of(world, getattr(opts, "context_guard", None)))
-    if getattr(opts, "attach", None) and not vision_enabled_of(world):
-        fail(world, "wisp run: --attach: %s" % VISION_OFF_NOTE)
-    steer_intake(world, records)
-    prompt = world.get("stdin").read_text()
-    if not prompt.strip():
-        fail(world, "no user prompt on stdin")
-    user_rec = {"type": "user", "content": prompt}
-    attachments = load_attachments(world, getattr(opts, "attach", None))
-    if attachments:
-        user_rec["attachments"] = attachments
-    records.append(user_rec)
-    return run_prepared(world, records, setup)
+    world.set("no_stream", bool(getattr(opts, "no_stream", False)))
+    lock = require_run_lock(world, opts.sessiondir)
+    wallclock = getattr(opts, "wallclock", None)
+    killer = install_wallclock(
+        world, DEFAULT_WALLCLOCK if wallclock is None else wallclock)
+    try:
+        setup, records = load_session_state(world, opts)
+        world.set("context_guard",
+                  context_guard_of(world, getattr(opts, "context_guard", None)))
+        if getattr(opts, "attach", None) and not vision_enabled_of(world):
+            fail(world, "wisp run: --attach: %s" % VISION_OFF_NOTE)
+        steer_intake(world, records)
+        prompt = world.get("stdin").read_text()
+        if not prompt.strip():
+            fail(world, "no user prompt on stdin", code=2)
+        user_rec = {"type": "user", "content": prompt}
+        attachments = load_attachments(world, getattr(opts, "attach", None))
+        if attachments:
+            user_rec["attachments"] = attachments
+        records.append(user_rec)
+        return run_prepared(world, records, setup)
+    finally:
+        cancel_wallclock(killer)
+        release_run_lock(lock)
 
 
 def continue_agent_loop(world: World, opts: Any) -> int:
@@ -850,22 +1194,252 @@ def continue_agent_loop(world: World, opts: Any) -> int:
     conversation. A stop-finish assistant tail - a finished plain
     run - and an empty log fail fast and name `wisp run`. Reads no
     stdin."""
-    setup, records = load_session_state(world, opts)
-    world.set("context_guard",
-              context_guard_of(world, getattr(opts, "context_guard", None)))
-    if not records or records[-1].get("type") == "system":
-        fail(world, "wisp continue: nothing to continue in %s"
-                    % opts.sessiondir)
+    world.set("no_stream", bool(getattr(opts, "no_stream", False)))
+    lock = require_run_lock(world, opts.sessiondir)
+    wallclock = getattr(opts, "wallclock", None)
+    killer = install_wallclock(
+        world, DEFAULT_WALLCLOCK if wallclock is None else wallclock)
+    try:
+        setup, records = load_session_state(world, opts)
+        world.set("context_guard",
+                  context_guard_of(world, getattr(opts, "context_guard", None)))
+        if not records or records[-1].get("type") == "system":
+            fail(world, "wisp continue: nothing to continue in %s"
+                 % opts.sessiondir, code=78, kind="nothing")
+        tail = records[-1]
+        if tail.get("type") == "assistant" and not any(
+                block.get("type") == "tool_call"
+                for block in tail.get("output") or []):
+            fail(world, "wisp continue: the run finished;"
+                 " use `wisp run` with a prompt", code=78, kind="nothing")
+        elif tail.get("type") not in ("user", "tool"):
+            fail(world, "wisp continue: nothing to continue in %s"
+                 % opts.sessiondir, code=78, kind="nothing")
+        return run_prepared(world, records, setup)
+    finally:
+        cancel_wallclock(killer)
+        release_run_lock(lock)
+
+
+def fork_session(world: World, opts: Any) -> int:
+    """`wisp fork`: copy one session into a new one (W7).
+
+    The source's wisp.jsonl and wisp.run.json are copied record for
+    record; created is set to now and -m/-t override the model pair.
+    With W13 no record is rewritten, so the copy is plain. The source
+    run lock is held non-blocking for the copy, so a live run cannot be
+    copied mid-commit. The destination is built in a sibling temp dir
+    and renamed into place."""
+    fs = world.get("fs")
+    src = os.path.abspath(opts.sessiondir)
+    fd = acquire_run_lock(world, src, blocking=False, write=False,
+                          shared=True)
+    if fd is None:
+        holder = lock_holder_of(src) or {}
+        fail(world, "wisp fork: source run lock busy (pid=%s start=%s)"
+             % (holder.get("pid", "?"), holder.get("start", "?")),
+             code=76, kind="busy")
+    try:
+        name = os.path.basename(src.rstrip("/"))
+        if opts.output:
+            dst = os.path.abspath(opts.output)
+        else:
+            n = 1
+            while True:
+                dst = os.path.join(os.path.dirname(src),
+                                   "%s-fork-%d" % (name, n))
+                if not fs.exists(dst):
+                    break
+                n += 1
+        if fs.exists(dst):
+            fail(world, "wisp fork: destination exists: %s" % dst)
+        parent = os.path.dirname(dst)
+        fs.mkdir(parent)
+        tmp = dst + ".tmp." + world.get("rng").token(8)
+        fs.mkdir(tmp)
+        try:
+            if not fs.exists(src + "/wisp.jsonl"):
+                fail(world, "wisp fork: source has no wisp.jsonl: %s" % src)
+            try:
+                records = fs.read_text(src + "/wisp.jsonl")
+            except OSError as exc:
+                fail(world, "wisp fork: cannot read %s/wisp.jsonl: %s"
+                     % (src, exc))
+            setup = world.get("session").load_run_setup(src)
+            fs.write_text(tmp + "/wisp.jsonl", records)
+            setup["created"] = now_iso()
+            if opts.model:
+                setup["model"] = opts.model
+            if opts.thinking:
+                setup["thinking"] = opts.thinking
+            fs.write_text(tmp + "/wisp.run.json",
+                          json.dumps(setup, sort_keys=True) + "\n")
+            fs.write_text(tmp + "/wisp.usage", "")
+            if fs.exists(src + "/wisp.modelcfg"):
+                fs.write_text(tmp + "/wisp.modelcfg",
+                              fs.read_text(src + "/wisp.modelcfg"))
+            os.rename(tmp, dst)
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+    finally:
+        release_run_lock(fd)
+    world.get("stdout").write(dst + "\n")
+    return 0
+
+
+def committed_view(records: list) -> list:
+    """The records a run would load: a dangling tool round is dropped.
+
+    `status` must agree with `continue`, so it uses the same discard rule
+    as Session._reload_committed without rewriting the log."""
+    out: list = []
+    pending = None
+    results: list = []
+    wanted = have = 0
+    for rec in records:
+        kind = rec.get("type")
+        if pending is not None and kind == "tool":
+            results.append(rec)
+            have += 1
+            if have >= wanted:
+                out.append(pending)
+                out.extend(results)
+                pending, results, wanted, have = None, [], 0, 0
+            continue
+        pending, results, wanted, have = None, [], 0, 0
+        if kind == "assistant":
+            count = sum(1 for block in rec.get("output") or []
+                        if block.get("type") == "tool_call")
+            if count:
+                pending = rec
+                wanted = count
+                continue
+        out.append(rec)
+    return out
+
+
+def tail_state_of(records: list) -> str:
+    """open, closed, or empty, from the last committed record."""
+    if not records or all(r.get("type") == "system" for r in records):
+        return "empty"
     tail = records[-1]
     if tail.get("type") == "assistant" and not any(
             block.get("type") == "tool_call"
             for block in tail.get("output") or []):
-        fail(world, "wisp continue: the run finished;"
-                    " use `wisp run` with a prompt")
-    elif tail.get("type") not in ("user", "tool"):
-        fail(world, "wisp continue: nothing to continue in %s"
-                    % opts.sessiondir)
-    return run_prepared(world, records, setup)
+        return "closed"
+    return "open"
+
+
+def last_error_of(world: World) -> dict | None:
+    """The last wisp.log error-shaped line, as one small dict."""
+    fs = world.get("fs")
+    path = world.get("sessiondir") + "/wisp.log"
+    if not fs.exists(path):
+        return None
+    found = None
+    try:
+        for line in fs.read_text(path).split("\n"):
+            parts = line.split(" ", 2)
+            if len(parts) < 2:
+                continue
+            event = parts[1]
+            if event not in ("error", "http_error", "crash", "degenerate"):
+                continue
+            body = parts[2] if len(parts) > 2 else ""
+            kind = "internal"
+            status = None
+            retry_after = None
+            for token in body.split():
+                if token.startswith("kind="):
+                    kind = token.split("=", 1)[1]
+                elif token.startswith("status="):
+                    try:
+                        status = int(token.split("=", 1)[1])
+                    except ValueError:
+                        status = None
+                elif token.startswith("retry_after="):
+                    try:
+                        retry_after = int(token.split("=", 1)[1])
+                    except ValueError:
+                        retry_after = None
+            found = {"kind": kind, "status": status,
+                     "retry_after": retry_after,
+                     "message": body, "ts": parts[0]}
+    except OSError:
+        return None
+    return found
+
+
+def steer_inbox_count(world: World) -> int:
+    """Complete JSON lines waiting in the steer inbox."""
+    fs = world.get("fs")
+    path = world.get("sessiondir") + "/" + STEER_INBOX
+    if not fs.exists(path):
+        return 0
+    count = 0
+    try:
+        for line in fs.read_text(path).split("\n"):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict) and isinstance(
+                    value.get("content"), str) and value["content"].strip():
+                count += 1
+    except OSError:
+        return 0
+    return count
+
+
+def status_command(world: World, opts: Any) -> int:
+    """`wisp status`: one block or one JSON object (W5)."""
+    world.set("sessiondir", opts.sessiondir)
+    world.set("read_only", True)
+    fs = world.get("fs")
+    sessiondir = opts.sessiondir
+    setup = world.get("session").load_run_setup(sessiondir)
+    records = committed_view(parse_records(
+        fs.read_text(sessiondir + "/wisp.jsonl")))
+    holder = lock_holder_of(sessiondir)
+    usage = {"prompt_tokens": 0, "completion_tokens": 0,
+             "total_tokens": 0}
+    upath = sessiondir + "/wisp.usage"
+    if fs.exists(upath):
+        state = read_usage_chunks(world, upath)
+        prompt_tokens = state["net"] + state["cache"] + state["write"]
+        usage = {"prompt_tokens": prompt_tokens,
+                 "completion_tokens": state["out"],
+                 "total_tokens": prompt_tokens + state["out"]}
+    data = {
+        "live": holder is not None,
+        "pid": holder.get("pid") if holder else None,
+        "start": holder.get("start") if holder else None,
+        "lock_holder": holder,
+        "tail": tail_state_of(records),
+        "commit_seq": len(records),
+        "steer_inbox": steer_inbox_count(world),
+        "created": created_of(world, setup, sessiondir, persist=False),
+        "model": setup.get("model"),
+        "thinking": setup.get("thinking"),
+        "last_error": last_error_of(world),
+        "usage": usage,
+    }
+    out = world.get("stdout")
+    if opts.as_json:
+        out.write(json.dumps(data, sort_keys=True) + "\n")
+        return 0
+    out.write("live: %s\n" % ("yes" if data["live"] else "no"))
+    if data["lock_holder"]:
+        out.write("pid: %s\nstart: %s\n" % (data["pid"], data["start"]))
+    out.write("tail: %s\ncommit_seq: %s\nsteer_inbox: %s\n"
+              "created: %s\nmodel: %s\nthinking: %s\n"
+              % (data["tail"], data["commit_seq"], data["steer_inbox"],
+                 data["created"], data["model"],
+                 data["thinking"] or "-"))
+    return 0
 
 
 def steer_command(world: World, opts: Any) -> int:
@@ -883,11 +1457,12 @@ def steer_command(world: World, opts: Any) -> int:
     world.set("sessiondir", opts.sessiondir)
     message = world.get("stdin").read_text()
     if not message.strip():
-        fail(world, "no steer message on stdin")
+        fail(world, "no steer message on stdin", code=2)
     fs = world.get("fs")
     inbox = opts.sessiondir + "/" + STEER_INBOX
-    fs.append_text(inbox, json.dumps(
-        {"content": message.rstrip("\n")}, ensure_ascii=False) + "\n")
+    with file_lock(opts.sessiondir + "/wisp.steer.lock"):
+        fs.append_text(inbox, json.dumps(
+            {"content": message.rstrip("\n")}, ensure_ascii=False) + "\n")
     world.get("session").log("steer", "queued=1")
     return 0
 
@@ -905,52 +1480,73 @@ def steer_intake(world: World, records: list) -> int:
     """Drain the steer inbox at one round boundary; the count of
     steered records appended.
 
-    One atomic rename - wisp.steer.inbox to a consumed name - takes
-    the whole mailbox, then the consumed copy is read: a `wisp steer`
-    append that lands after the rename starts a fresh inbox, so no
-    message is lost and none is read twice. Each complete JSON line
-    becomes one steered user record, marked wisp_steered: a plain user
-    record on the wire that never opens a segment and never resets
-    the round counter. A line that fails json.loads is a mid-append
-    kill remnant; it is skipped, not injected. The records commit
-    before the loop runs on - flush_records - so a kill after the
-    drain loses nothing: the steered record is on disk and a later
-    `wisp continue` resumes it. Each injection writes one
-    `data: {"wisp":"steer",...}` stream line, so a live `wisp render-live`
-    shows the steering; one steer line lands in wisp.log."""
+    The intake holds the steer lock across the whole drain: it
+    recovers every `wisp.steer.inbox.<token>` file an earlier kill left
+    behind, renames the inbox, parses every line into steered user
+    records, commits them with flush_records, and only then removes the
+    consumed files. A read failure renames the inbox copy back, so a
+    transient error cannot delete a batch; a kill after the commit but
+    before a remove can replay a message, which is at-least-once and
+    never a loss. Each injection writes one
+    `data: {"wisp":"steer",...}` stream line."""
     fs = world.get("fs")
-    inbox = world.get("sessiondir") + "/" + STEER_INBOX
-    if not fs.exists(inbox):
-        return 0
-    consumed = "%s.%s" % (inbox, world.get("rng").token(8))
-    try:
-        fs.rename(inbox, consumed)
-    except OSError:
-        return 0
-    try:
-        text = fs.read_text(consumed)
-    except OSError:
-        text = ""
+    sessiondir = world.get("sessiondir")
+    inbox = sessiondir + "/" + STEER_INBOX
+    sources: list[tuple[str, str]] = []
     count = 0
-    for line in text.split("\n"):
-        if not line.strip():
-            continue
+    with file_lock(sessiondir + "/wisp.steer.lock"):
         try:
-            message = json.loads(line)
-        except ValueError:
-            continue
-        content = (message.get("content")
-                   if isinstance(message, dict) else None)
-        if not isinstance(content, str) or not content.strip():
-            continue
-        records.append({"type": "user", "content": content,
-                        "wisp_steered": True})
-        world.get("stdout").write("data: %s\n" % json.dumps(
-            {"wisp": "steer", "content": content}, ensure_ascii=False))
-        count += 1
-    fs.remove(consumed)
+            names = fs.listdir(sessiondir)
+        except OSError:
+            names = []
+        for name in sorted(names):
+            if not name.startswith(STEER_INBOX + "."):
+                continue
+            path = os.path.join(sessiondir, name)
+            try:
+                sources.append((path, fs.read_text(path)))
+            except OSError:
+                continue
+        if fs.exists(inbox):
+            consumed = "%s.%s" % (inbox, world.get("rng").token(8))
+            try:
+                fs.rename(inbox, consumed)
+            except OSError:
+                consumed = None
+            if consumed:
+                try:
+                    sources.append((consumed, fs.read_text(consumed)))
+                except OSError:
+                    try:
+                        fs.rename(consumed, inbox)
+                    except OSError:
+                        pass
+        for _path, text in sources:
+            for line in text.split("\n"):
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line)
+                except ValueError:
+                    continue
+                content = (message.get("content")
+                           if isinstance(message, dict) else None)
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                records.append({"type": "user", "content": content,
+                                "wisp_steered": True})
+                event_out(world).write("data: %s\n" % json.dumps(
+                    {"wisp": "steer", "content": content},
+                    ensure_ascii=False))
+                count += 1
+        if count:
+            flush_records(world, records)
+        for path, _text in sources:
+            try:
+                fs.remove(path)
+            except OSError:
+                pass
     if count:
-        flush_records(world, records)
         world.get("session").log("steer", "injected=%s" % count)
     return count
 
@@ -1086,7 +1682,8 @@ def turn_with_degenerate_guard(world: World, llm: Any, records: list,
                     " response - no text and no tool calls -"
                     " after %s attempts (WISP_DEGENERATE_RETRY)%s;"
                     " the finished rounds stay on disk"
-             % (round_no, result["finish_reason"] or "<none>", bound, cause))
+             % (round_no, result["finish_reason"] or "<none>", bound, cause),
+             code=79, kind="degenerate")
     raise AssertionError("unreachable: the guard returns or fails")
 
 
@@ -1301,7 +1898,7 @@ def commit_guard():
     try:
         signal.pthread_sigmask(signal.SIG_BLOCK,
                                {signal.SIGINT, signal.SIGTERM,
-                                signal.SIGHUP})
+                                signal.SIGHUP, signal.SIGALRM})
         blocked = True
     except (AttributeError, OSError, ValueError):
         blocked = False  # no mask on this platform: commit unguarded
@@ -1311,7 +1908,7 @@ def commit_guard():
         if blocked:
             signal.pthread_sigmask(signal.SIG_UNBLOCK,
                                    {signal.SIGINT, signal.SIGTERM,
-                                    signal.SIGHUP})
+                                    signal.SIGHUP, signal.SIGALRM})
 
 
 def flush_records(world: World, records: list) -> None:
@@ -1393,11 +1990,17 @@ def render_past(world: World, opts: Any) -> int:
     carried. Read-only: a broken line is skipped, a dangling tool_call
     renders without its result."""
     world.set("sessiondir", opts.sessiondir)
+    world.set("read_only", True)
     fs = world.get("fs")
     path = opts.sessiondir + "/wisp.jsonl"
+    if fs.exists(opts.sessiondir + "/wisp.run.json"):
+        setup = world.get("session").load_run_setup(opts.sessiondir)
+        world.set("setup", setup)
+        world.set("model", setup.get("model"))
+        world.set("thinking", setup.get("thinking"))
     records = parse_records(fs.read_text(path))
     renderer = Renderer(world)
-    for line in records_to_stream(records):
+    for line in records_to_stream(world, records):
         renderer.render_line(line)
     renderer.finish()
     return 0
@@ -1766,9 +2369,11 @@ def record_match_line(text: str, pattern) -> str:
 
 COMMANDS: dict[str, Callable[[World, Any], int]] = {
     "new": new_session,
+    "fork": fork_session,
     "run": run_agent_loop,
     "continue": continue_agent_loop,
     "steer": steer_command,
+    "status": status_command,
     "skill": skill_command,
     "agents-md": agents_md_command,
     "build-system-prompt": build_system_prompt,
@@ -1803,6 +2408,12 @@ class Opts:
         self.wisp = False    # build-system-prompt --wisp
         self.wisp_subagents = False  # build-system-prompt --wisp-subagents
         self.env_in_system_prompt = False  # new --env-in-system-prompt
+        self.output = None   # fork -o
+        self.record = False  # build-system-prompt --record
+        self.include_env = False  # build-system-prompt --include-env
+        self.as_json = False     # status --json
+        self.no_stream = False   # run/continue --no-stream
+        self.wallclock = None    # run/continue --wallclock
         self.search_global = False  # ls/grep --global
         self.tree = False           # ls/grep --tree
         self.ignorecase = False     # grep -i
@@ -1810,8 +2421,9 @@ class Opts:
 
 
 SESSION_DIR_COMMANDS = ("run", "continue", "steer", "render-past",
-                    "usage", "response")
-"""Commands that bind -d and WISP_SESSION_DIR. new has no -d; render-live
+                    "usage", "response", "fork", "status")
+"""Commands that bind -d and WISP_SESSION_DIR. new's -d is a parent
+root, not a session, so it is resolved by destination_root; render-live
 listens on stdin only. skill, agents-md and build-system-prompt take
 no -d: they walk from the CWD upwards and read the user-level
 places. ls and grep join them only in --tree scope; project and
@@ -1916,7 +2528,8 @@ def parse_args(world: World, argv: list[str]) -> Any:
 
     valued = {"--name": "name", "-m": "model", "-t": "thinking",
               "-d": "sessiondir", "-s": "sysfile", "--parent": "parent",
-              "--context-guard": "context_guard"}
+              "--context-guard": "context_guard", "-o": "output",
+              "--wallclock": "wallclock"}
     while rest:
         arg = rest.pop(0)
         if arg.startswith("--context-guard="):
@@ -1935,6 +2548,14 @@ def parse_args(world: World, argv: list[str]) -> Any:
             opts.wisp_subagents = True
         elif arg == "--env-in-system-prompt":
             opts.env_in_system_prompt = True
+        elif arg == "--record" or arg == "--wisp-jsonl":
+            opts.record = True
+        elif arg == "--include-env":
+            opts.include_env = True
+        elif arg == "--json":
+            opts.as_json = True
+        elif arg == "--no-stream":
+            opts.no_stream = True
         elif arg == "--attach":
             if not rest:
                 fail(world, "wisp: --attach needs a value")
@@ -1949,6 +2570,38 @@ def parse_args(world: World, argv: list[str]) -> Any:
             fail(world, "wisp new: -m MODEL is required")
         if opts.sysfile and not world.get("fs").exists(opts.sysfile):
             fail(world, "system file not found: %s" % opts.sysfile)
+    if opts.command == "fork":
+        if not opts.sessiondir:
+            fail(world, "wisp fork: pass -d SRC")
+        if opts.sysfile or opts.parent or opts.attach:
+            fail(world, "wisp fork: takes -d SRC, -o DST, -m and -t only")
+    if opts.record or opts.include_env:
+        if opts.command != "build-system-prompt":
+            fail(world, "wisp %s: --record and --include-env are"
+                        " build-system-prompt flags" % opts.command)
+        if opts.include_env and not opts.record:
+            fail(world, "wisp build-system-prompt: --include-env needs"
+                        " --record")
+    if opts.as_json and opts.command != "status":
+        fail(world, "wisp %s: --json is a status flag" % opts.command)
+    if opts.output and opts.command != "fork":
+        fail(world, "wisp %s: -o is a fork flag" % opts.command)
+    if opts.no_stream:
+        if opts.command not in ("run", "continue"):
+            fail(world, "wisp %s: --no-stream is a flag of wisp run and"
+                        " wisp continue" % opts.command)
+    if opts.wallclock is not None:
+        if opts.command not in ("run", "continue"):
+            fail(world, "wisp %s: --wallclock is a flag of wisp run and"
+                        " wisp continue" % opts.command)
+        try:
+            opts.wallclock = int(opts.wallclock)
+        except ValueError:
+            fail(world, "wisp %s: --wallclock needs whole seconds"
+                        % opts.command)
+        if opts.wallclock < 0:
+            fail(world, "wisp %s: --wallclock needs 0 or a positive"
+                        " number of seconds" % opts.command)
     # The subagent block is a section of the wisp block: opting into
     # subagents opts into the block that carries them.
     if opts.wisp_subagents:
@@ -1962,7 +2615,7 @@ def parse_args(world: World, argv: list[str]) -> Any:
         if opts.sessiondir:
             fail(world, "wisp %s: does not take -d" % opts.command)
     if opts.command in ("run", "continue", "steer", "render-past",
-                        "usage", "response"):
+                        "usage", "response", "status"):
         if opts.model or opts.thinking or opts.sysfile or opts.parent:
             fail(world, "wisp %s: takes only -d; model, thinking, the"
                         " system record and the parent link live in the"
@@ -1995,6 +2648,8 @@ def command_help_text(cmd: str) -> str:
             "the next commands; a plain assignment does not reach them.",
             "",
             "  --name NAME                   the session dir name, else a rand8",
+            "  -d DIR                        the parent directory; DIR is created",
+            "                              with its parents; the leaf is --name",
             "  -m MODEL                      required, the run's model",
             "  -t THINKING                   thinking fields, else the default set",
             "  -s SYSFILE                    system prompt file, it must exist",
@@ -2012,12 +2667,37 @@ def command_help_text(cmd: str) -> str:
             "                              wisp.run.json and the child id",
             "                              into the parent's children list",
         ]) + "\n",
+        "fork": "\n".join([
+            "wisp fork: copy a session into a new one.",
+            "",
+            "  wisp fork -d SRC [-o DST] [-m MODEL] [-t THINKING]",
+            "",
+            "Copies SRC's wisp.jsonl and wisp.run.json record for record,",
+            "sets created to now, and applies -m/-t over the copied",
+            "setup. With request-time <environment> no record is",
+            "rewritten. The default destination is",
+            "<src-parent>/<src-name>-fork-N, first free N; the copy is",
+            "built in a sibling temp dir and renamed into place. The",
+            "source run lock is taken non-blocking, so a live SRC exits",
+            "76. Prints the destination path.",
+        ]) + "\n",
+        "status": "\n".join([
+            "wisp status: show one session's live facts.",
+            "",
+            "  wisp status [-d DIR] [--json]",
+            "",
+            "live, pid, start, lock_holder, tail (open|closed|empty),",
+            "commit_seq, steer_inbox, created, model, thinking,",
+            "last_error, and usage. --json prints one object with those",
+            "keys. live is the held run lock, so it survives a reader",
+            "that never saw the run start.",
+        ]) + "\n",
         "run": "\n".join([
             "wisp run: run LLM rounds; stream each round to stdout,",
             "commit each completed round to wisp.jsonl as it ends.",
             "",
             "  wisp run [-d DIR] [--attach FILE] [--context-guard LIMIT]",
-            "           < prompt",
+            "           [--no-stream] [--wallclock SECONDS] < prompt",
             "",
             "The session dir carries the setup. Model and thinking come from",
             "wisp.run.json; then the command is uniform. The prompt is",
@@ -2034,6 +2714,10 @@ def command_help_text(cmd: str) -> str:
             "<DIR>/wisp.steer.inbox; the run drains the inbox at each",
             "round boundary, before its prompt on a stale inbox, and",
             "warns on stderr when messages wait past the run's end.",
+            "--no-stream writes no data: lines to stdout; the rounds",
+            "still commit. --wallclock SECONDS stops the run at the",
+            "limit with SIGTERM and a 5 s grace, then SIGKILL; the exit",
+            "is 124. The default is 600 s; 0 disables the limit.",
             "Context guard: --context-guard LIMIT stops the run at a",
             "round boundary when the last round's prompt tokens cross",
             "the limit. '70%' is a percent of the model's context",
@@ -2060,6 +2744,7 @@ def command_help_text(cmd: str) -> str:
             "wisp continue: finish an open segment without a new prompt.",
             "",
             "  wisp continue [-d DIR] [--context-guard LIMIT]",
+            "                [--no-stream] [--wallclock SECONDS]",
             "",
             "Resume after a kill or a MAX_TURNS stop: the loaded",
             "conversation runs as is, no user record is appended, so",
@@ -2253,9 +2938,8 @@ def print_command_help(world: World, cmd: str) -> None:
 def unknown_sub(world: World, parent: str, sub: str) -> None:
     """An unknown nested command: the error line on stderr, the parent
     command's help on stdout, exit 1."""
-    world.get("stderr").write("wisp: unknown command: %s\n" % sub)
     world.get("stdout").write(command_help_text(parent))
-    raise SystemExit(1)
+    fail(world, "unknown command: %s" % sub, code=2, kind="usage")
 
 
 def no_such_command(world: World, cmd: str) -> None:
@@ -2263,9 +2947,8 @@ def no_such_command(world: World, cmd: str) -> None:
     module docstring on stdout, exit 1. The single path to this
     state: parse_args validates argv[0] first, so main never sees
     an unvalidated command."""
-    world.get("stderr").write("wisp: unknown command: %s\n" % cmd)
     world.get("stdout").write(__doc__)
-    raise SystemExit(1)
+    fail(world, "unknown command: %s" % cmd, code=2, kind="usage")
 
 
 # --- filesystem IO ----------------------------------------------------------------
@@ -2288,7 +2971,11 @@ class Fs:
         temp file, then os.replace it over the path. A kill mid-
         replace leaves either the old or the new content, never a mix
         of both."""
-        tmp = path + ".tmp"
+        try:
+            token = self._world.get("rng").token(8)
+        except KeyError:
+            token = "%s-%s" % (os.getpid(), int(time.time() * 1000))
+        tmp = path + ".tmp." + token
         with open(tmp, "w", encoding="utf-8") as handle:
             handle.write(text)
         os.replace(tmp, path)
@@ -2391,7 +3078,27 @@ class Rng:
 
 
 class HttpError(Exception):
-    """One HTTP failure, with the status and a cause text in the message."""
+    """One HTTP failure, with the status, the retry hint, and a cause."""
+
+    def __init__(self, message: str, status: int | None = None,
+                 retry_after: int | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
+def http_error_of(exc: urllib.error.HTTPError) -> HttpError:
+    """Wrap one HTTP status error, keeping the status and Retry-After."""
+    retry_after = None
+    try:
+        raw = exc.headers.get("Retry-After") if exc.headers else None
+        if raw is not None:
+            retry_after = int(str(raw).strip())
+    except (AttributeError, TypeError, ValueError):
+        retry_after = None
+    snippet = exc.read(4096).decode("utf-8", "replace").strip()
+    return HttpError("%s %s" % (exc.code, snippet or exc.reason),
+                     status=exc.code, retry_after=retry_after)
 
 
 HTTP_TIMEOUT = 600
@@ -2450,8 +3157,7 @@ class Http:
             if meta is not None:
                 meta["status"] = exc.code
                 meta["request_id"] = request_id_of_headers(exc.headers)
-            snippet = exc.read(4096).decode("utf-8", "replace").strip()
-            raise HttpError("%s %s" % (exc.code, snippet or exc.reason)) from exc
+            raise http_error_of(exc) from exc
         except (urllib.error.URLError, OSError) as exc:
             raise HttpError(str(exc)) from exc
         if meta is not None:
@@ -2479,8 +3185,7 @@ class Http:
             if meta is not None:
                 meta["status"] = exc.code
                 meta["request_id"] = request_id_of_headers(exc.headers)
-            snippet = exc.read(4096).decode("utf-8", "replace").strip()
-            raise HttpError("%s %s" % (exc.code, snippet or exc.reason)) from exc
+            raise http_error_of(exc) from exc
         except (urllib.error.URLError, OSError) as exc:
             raise HttpError(str(exc)) from exc
         if meta is not None:
@@ -2620,6 +3325,19 @@ class Executor:
                     break
                 route(chunk)
         finally:
+            if sys.exc_info()[0] is not None:
+                # An exception - a wall clock alarm, a signal, a Ctrl-C
+                # - unwinds through this frame. The tool child runs in
+                # its own session, so kill the whole group or it keeps
+                # writing after wisp has exited and the slot is reused.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
             if spill_out[0] is not None:
                 spill_out[0].close()
             proc.stdout.close()
@@ -2677,14 +3395,24 @@ class Session:
         self._world = world
 
     def write_run_setup(self, path: str, model: str, thinking: str | None,
-                        parent: str | None = None) -> None:
-        """Persist the run setup into <path>/wisp.run.json; thinking
-        and the parent link only when set."""
+                        parent: str | None = None,
+                        created: str | None = None,
+                        project_dir: str | None = None) -> None:
+        """Persist the run setup into <path>/wisp.run.json; thinking,
+        parent, created, and project_dir only when set.
+
+        created and project_dir feed the request-time <environment>
+        block (W13). No env_in_system_prompt key exists: the marker
+        rides the system record, not the setup."""
         setup = {"model": model}
         if thinking:
             setup["thinking"] = thinking
         if parent:
             setup["parent"] = parent
+        if created:
+            setup["created"] = created
+        if project_dir:
+            setup["project_dir"] = project_dir
         self._world.get("fs").write_text(
             path + "/wisp.run.json", json.dumps(setup, sort_keys=True) + "\n")
 
@@ -2702,14 +3430,14 @@ class Session:
             fail(world, "wisp.run.json has no model: %s" % cfgpath)
         return setup
 
-    def write_initial_log(self, path: str, system_text: str | None) -> None:
-        """Create wisp.jsonl, the system record first when system_text is
-        given, plus an empty wisp.usage."""
-        world, fs = self._world, self._world.get("fs")
+    def write_initial_log(self, path: str, system_record: dict | None) -> None:
+        """Create wisp.jsonl, the system record first when given, plus
+        an empty wisp.usage. The record is stored verbatim: no text is
+        composed here (W13)."""
+        fs = self._world.get("fs")
         records = []
-        if system_text:
-            records.append({"type": "system",
-                            "content": system_text.rstrip("\n")})
+        if system_record:
+            records.append(system_record)
         fs.write_text(path + "/wisp.jsonl", "".join(
             json.dumps(rec, ensure_ascii=False) + "\n" for rec in records))
         fs.write_text(path + "/wisp.usage", "")
@@ -3027,7 +3755,7 @@ class Tools:
         return spill_dir + "/" + world.get("rng").token(8)
 
     def _inject(self, payload: dict) -> None:
-        self._world.get("stdout").write(
+        event_out(self._world).write(
             "data: %s\n" % json.dumps(payload, ensure_ascii=False))
 
 
@@ -3266,11 +3994,11 @@ def tools_spec_of(provider: str) -> list:
     return out
 
 
-def anthropic_system_text(records: list) -> str:
-    """The joined system texts of the record list; the anthropic body
-    carries the system prompt as one top-level string, not as a
-    message."""
-    return "\n".join(r["content"] for r in records if r.get("type") == "system")
+def anthropic_system_text(world: World, records: list) -> str:
+    """The joined rendered system texts; the anthropic body carries the
+    system prompt as one top-level string, not as a message."""
+    return "\n".join(system_text_of(world, r)
+                      for r in records if r.get("type") == "system")
 
 
 class Llm:
@@ -3838,7 +4566,10 @@ def body_of_chat(world: World, records: list) -> dict:
     pending_images = []
     for rec in records:
         wire_rec = rec
-        if wire_rec.get("type") == "user":
+        if wire_rec.get("type") == "system":
+            wire_rec = dict(wire_rec)
+            wire_rec["content"] = system_text_of(world, wire_rec)
+        elif wire_rec.get("type") == "user":
             wire_rec = dict(wire_rec)
             wire_rec["content"] = user_text_of(wire_rec)
         if rec.get("type") == "tool":
@@ -3915,7 +4646,7 @@ def body_of_responses(world: World, records: list) -> dict:
         kind = rec.get("type")
         if kind == "system":
             instructions = ((instructions + "\n" if instructions else "")
-                            + rec["content"])
+                            + system_text_of(world, rec))
             continue
         wire_rec = rec
         if kind == "user":
@@ -3964,7 +4695,7 @@ def body_of_anthropic(world: World, records: list) -> dict:
         kind = rec.get("type")
         if kind == "system":
             system = ((system + "\n" if system else "")
-                      + rec["content"])
+                      + system_text_of(world, rec))
             continue
         wire_rec = rec
         if kind == "user":
@@ -4376,7 +5107,7 @@ def sse_stream(world: World, body: dict) -> Iterator[dict]:
     headers = auth_headers_of(world)
     http = world.get("http")
     meta = {}
-    out = world.get("stdout")
+    out = event_out(world)
     first_line = ""
     saw_data = False
     accepted = False
@@ -4460,7 +5191,7 @@ def json_turn(world: World, body: dict) -> Iterator[dict]:
     headers = auth_headers_of(world)
     http = world.get("http")
     meta = {}
-    out = world.get("stdout")
+    out = event_out(world)
     started = world.get("clock").ms()
     safe_log(world, "http", "post", "url=%s" % url,
              "bytes=%s" % len(json.dumps(body).encode("utf-8")))
@@ -5150,7 +5881,7 @@ class Renderer:
         self._last_kind = None
 
 
-def records_to_stream(records: list) -> Iterator[str]:
+def records_to_stream(world: World, records: list) -> Iterator[str]:
     """Yield one `data:` line per renderer payload, in the order the
     live stream carried it.
 
@@ -5185,7 +5916,8 @@ def records_to_stream(records: list) -> Iterator[str]:
             if kind == "user" and rec.get("wisp_steered"):
                 yield emit({"wisp": "steer", "content": rec.get("content", "")})
             else:
-                content = rec.get("content", "")
+                content = (system_text_of(world, rec) if kind == "system"
+                           else rec.get("content", ""))
                 for att in rec.get("attachments") or []:
                     content += "\n[attachment: %s, %s]" % (
                         att.get("name", ""), att.get("media_type", ""))
@@ -5255,6 +5987,7 @@ IMPLS: dict[str, Callable[[World], Any]] = {
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     world = World(IMPLS)
+    world.set("phase", "parse")
     cmd = argv[0] if argv else "<none>"
     rc = 1
     try:
@@ -5263,6 +5996,7 @@ def main(argv: list[str] | None = None) -> int:
             rc = 0
         else:
             cmd, opts = parse_args(world, argv)
+            world.set("phase", "run")
             rc = COMMANDS[cmd](world, opts)
     except BrokenPipeError:
         # The reader closed the pipe, the usual "wisp ls | head". Point
@@ -5276,17 +6010,27 @@ def main(argv: list[str] | None = None) -> int:
         rc = 141
     except SignalExit as exc:
         world.get("stderr").write(
-            "wisp: signal %s; committed wisp.jsonl; exit %s\n"
-            % (exc.signum, 128 + exc.signum))
+            "wisp: error kind=signal signum=%s committed wisp.jsonl;"
+            " exit %s\n" % (exc.signum, 128 + exc.signum))
         rc = 128 + exc.signum
     except KeyboardInterrupt:
         # Ctrl-C: the run loop's finally already committed the tail;
         # exit 130, the SIGINT convention, without a traceback.
         world.get("stderr").write(
-            "wisp: signal 2; committed wisp.jsonl; exit 130\n")
+            "wisp: error kind=signal signum=2 committed wisp.jsonl;"
+            " exit 130\n")
         rc = 130
+    except WallclockExit as exc:
+        world.get("stderr").write(
+            "wisp: error kind=wallclock limit=%ss committed wisp.jsonl;"
+            " exit 124\n" % exc.seconds)
+        safe_log(world, "error", "kind=wallclock", "code=124",
+                 "limit=%ss" % exc.seconds)
+        rc = 124
     except HttpError as exc:
-        fail(world, "http error: %s" % exc)
+        fail(world, "http error: %s" % exc, code=77, kind="http",
+             status=getattr(exc, "status", None),
+             retry_after=getattr(exc, "retry_after", None))
     except SystemExit as exc:
         rc = exc.code if isinstance(exc.code, int) else 1
     except Exception:
@@ -5295,7 +6039,8 @@ def main(argv: list[str] | None = None) -> int:
         # stderr is lost; the exit line in the finally then closes it.
         safe_log(world, "crash", traceback.format_exc().replace("\n", " | ")[:4000])
         world.get("stderr").write(
-            "wisp: internal error; the traceback is in wisp.log\n")
+            "wisp: error kind=internal internal error; the traceback is"\
+            " in wisp.log\n")
         rc = 1
     finally:
         safe_log(world, "exit", "cmd=%s" % cmd,

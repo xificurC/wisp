@@ -179,7 +179,7 @@ class DegenerateStopTest(unittest.TestCase):
     def test_all_retries_empty_fails_and_writes_only_nudges(self):
         with self.assertRaises(SystemExit) as caught:
             self.h.run([_degenerate()] * 3)
-        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(caught.exception.code, 79)
         self.assertIn("empty or textless stop response", self.h.stderr())
         self.assertEqual(
             len(self.h.log_lines("degenerate")), 1)
@@ -231,7 +231,7 @@ class DegenerateStopTest(unittest.TestCase):
         is gone. The appended thinking stays on disk for the resume."""
         with self.assertRaises(SystemExit) as caught:
             self.h.run([_reasoning_only(usage=[{"total_tokens": 9}])] * 3)
-        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(caught.exception.code, 79)
         self.assertIn("empty or textless stop response", self.h.stderr())
         self.assertEqual(len(self.h.log_lines("retry")), 2)
         self.assertEqual(len(self.h.log_lines("degenerate")), 1)
@@ -246,7 +246,7 @@ class DegenerateStopTest(unittest.TestCase):
         fails and only the retry nudges reach the jsonl."""
         with self.assertRaises(SystemExit) as caught:
             self.h.run([_empty_with_usage()] * 3)
-        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(caught.exception.code, 79)
         self.assertEqual(self.h.llm.calls, 3)
         self.assertEqual(len(self.h.log_lines("retry")), 2)
         self.assertEqual(len(self.h.log_lines("degenerate")), 1)
@@ -359,7 +359,7 @@ class EmptySseStreamTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             wisp.loop_rounds(
                 self.h.world, [{"type": "user", "content": "turn"}], 10, None)
-        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(caught.exception.code, 79)
         self.assertEqual(http.posts, 3)
         self.assertIn("no completion payload", self.h.stderr())
         self.assertIn("request id: req-empty", self.h.stderr())

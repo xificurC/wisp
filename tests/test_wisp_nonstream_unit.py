@@ -51,8 +51,8 @@ except SystemExit as exc:
 else:
     raise AssertionError("an unknown WISP_LLM_STREAM must fail")
 assert bad.get("stderr").text == (
-    "wisp: unknown WISP_LLM_STREAM maybe (leave it unset for a stream,"
-    " or set false, 0, no or off)\n"), bad.get("stderr").text
+    "wisp: error kind=internal unknown WISP_LLM_STREAM maybe (leave it"
+    " unset for a stream, or set false, 0, no or off)\n"), bad.get("stderr").text
 
 # --- body gate ---------------------------------------------------------------
 
@@ -143,7 +143,7 @@ except SystemExit as exc:
 else:
     raise AssertionError("stream off outside openai-chat must fail")
 assert gate.get("stderr").text == (
-    "wisp: WISP_LLM_STREAM=false needs WISP_LLM_API=openai-chat"
-    " (got anthropic)\n"), gate.get("stderr").text
+    "wisp: error kind=internal WISP_LLM_STREAM=false needs"
+    " WISP_LLM_API=openai-chat (got anthropic)\n"), gate.get("stderr").text
 
 print("PASS: test_wisp_nonstream_unit")
