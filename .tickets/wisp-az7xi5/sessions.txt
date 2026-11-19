@@ -4,3 +4,5 @@
 /home/pnagyux/code/wisp/wisp-sessions/wisp-az7xi5-004
 /home/pnagyux/code/wisp/wisp-sessions/wisp-az7xi5-005
 /home/pnagyux/code/wisp/wisp-sessions/wisp-az7xi5-c01
+/home/pnagyux/code/wisp/wisp-sessions/wisp-az7xi5-006
+/home/pnagyux/code/wisp/wisp-sessions/wisp-az7xi5-c02

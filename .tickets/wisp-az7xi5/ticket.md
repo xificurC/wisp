@@ -32,7 +32,7 @@ blocked-on: []
   `wisp.run.json` and `wisp ls --tree` expose the tree. A team run must sum
   the whole tree, not the parent session alone.
 - Turn cap: `WISP_LLM_MAX_TURNS` caps rounds. `wisp run --wallclock S` caps
-  wall time (default 600 s).
+  wall time (default 24 h, `DEFAULT_WALLCLOCK` at `wisp/wisp` line 399).
 - Session state: `wisp status -d DIR --json` returns tail, model, thinking,
   and usage totals.
 
@@ -233,3 +233,44 @@ Harbor hides the token columns on the job page and trial table by default
 (the `Columns` control enables them), and the tables print USD with two
 decimals, so sub-cent trials read `$0.00` there. `aggregate.py` and the
 trial step list print four decimals.
+
+## Quick loop (2026-11-19)
+
+The first tb2 pass `-l 5 -n 2 --effort xhigh` did not finish in 45 min. Cause:
+tb2 agent timeouts are 900–3600 s per task, and wisp's `DEFAULT_WALLCLOCK` is
+24 h, so nothing inside wisp stops a trial; Harbor killed two trials at its own
+agent timeout (900 s and 1800 s) and the user killed the job. No task in
+terminal-bench@2.0 has a short timeout except `hello-world` (120 s).
+
+Public timings: the tbench.ai leaderboard embeds only per-model
+`avg_trial_duration_sec` (top models 3,500–7,400 s), not per-task times. The
+tb4 dataset publishes `expert_time_estimate_hours` per task, and the curated
+repo's `results/*.json` rows carry per-trial start and finish. Measured trial
+times over 9 runs of each tb4 task:
+
+| median | min | task |
+|---|---|---|
+| 419 s | 246 s | session-window-debug |
+| 421 s | 235 s | bun-sourcemap-leak |
+| 565 s | 276 s | wal-recovery-ordering |
+| 593 s | 401 s | mvcc-lsm-compaction |
+| 611 s | 246 s | music-harmony |
+
+Validated quick loop, 3m 09s wall, $0.00092, two trials in parallel:
+
+```
+bench/bin/harbor run \
+  -p ~/code/curated-terminal-benchmark/artifacts/datasets/terminal-bench \
+  -i session-window-debug -i bun-sourcemap-leak \
+  -a wisp_harbor:Wisp -m MODEL -e podman \
+  -n 2 -k 1 -y --agent-timeout-multiplier 0.0035 -o bench/jobs/quick4
+```
+
+tb4 task timeouts are 28800 s, so the multiplier 0.0035 caps agent execution at
+101 s. Per-trial phases: environment 10–14 s, agent setup 25–37 s, agent
+101 s, verifier 20–33 s. Both trials end with `AgentTimeoutError`, reward 0.0;
+the loop measures the harness, not the model. Job:
+`bench/jobs/quick4/2026-11-19__10-04-17`.
+
+The one-minute smoke is `hello-world@1.0`: 1m 03s, reward 1.0, no cap needed
+(job `bench/jobs/quick/2026-11-19__09-51-39`).

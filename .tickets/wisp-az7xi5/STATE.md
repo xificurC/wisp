@@ -1,25 +1,24 @@
 # Next
-- Run the first real pass: `cd /home/pnagyux/code/wisp && bench/bin/harbor run -d terminal-bench@2.0 -a wisp_harbor:Wisp -m MODEL -e podman -l 20 -n 4 -k 1 -y -o bench/jobs/tb2-first`.
-- Aggregate the pass: `python3 bench/aggregate.py bench/jobs/tb2-first`.
-- Browse the pass: `bench/bin/harbor view bench/jobs/tb2-first/<timestamp> --jobs`.
-- No env setup needed: `WISP_LLM_URL`, `WISP_LLM_API_KEY`, `WISP_LLM_MODEL_INFO_FILE` are already exported in the login shell.
+- Run the two-task quick loop from ticket `## Quick loop` after an adapter or aggregator edit: 3m 09s, $0.00092, both trials end `AgentTimeoutError` with reward 0.0 by design.
+- Run `hello-world@1.0` as the 1-minute smoke when the question is whether the pipeline still works end to end.
+- Run nothing longer until the user picks a time budget for the scored pass.
 
 # Open
 - None.
 
 # Cache
-- The adapter now writes `<trial>/agent/trajectory.json` and fills `agent_result.cost_usd` plus the three token totals; `harbor view` reads job and trial table totals from `result.json` and per-step token metrics plus total cost from `trajectory.json`. (From: `bench/wisp_harbor.py`, `bench/jobs/smoke2/2026-11-18__14-55-05/*/result.json`, `bench/jobs/smoke2/2026-11-18__14-55-05/*/agent/trajectory.json`) (Serves: Next)
-- Old jobs need `bench/.venv/bin/python bench/backfill.py JOBS_DIR`; the script writes the trajectory, rewrites each trial `agent_result`, and recomputes job totals. Verified on `bench/jobs/smoke`: 3,426 in / 191 out / $0.000156. (From: `bench/backfill.py`, backfill run output) (Serves: cold)
-- `harbor view` hides token columns on the job page and trial table by default; the `Columns` control shows them and the choice persists in the URL. Tables print USD with two decimals, so sub-cent trials read `$0.00`; `aggregate.py` and the trial step list print four decimals. (From: viewer static JS, smoke2 viewer API, `bench/README.md`) (Serves: Next)
-- `terminal-bench@2.0` is prefetched: all 89 tasks (49 MB) sit in `~/.cache/harbor/tasks`, so the first pass needs no dataset download. (From: `harbor download terminal-bench@2.0 --cache` output, ticket `## Setup`) (Serves: Next)
-- `harbor view bench/jobs` fails with "Could not auto-detect folder type"; `harbor view bench/jobs/smoke --jobs` works. The `-o bench/jobs/NAME` option nests a timestamped job dir under NAME. (From: `harbor view bench/jobs` error, `harbor view bench/jobs/smoke --jobs` output) (Serves: Next)
-- Dry-run without trials: append `--print-config` to any `bench/bin/harbor run` command. (From: `harbor run --help`, ticket `## Setup`) (Serves: cold)
+- No public per-task runtime table exists: tbench.ai/leaderboard embeds only per-model `avg_trial_duration_sec` (3,500–7,400 s), so a per-task ranking needs the tb4 dataset's `expert_time_estimate_hours` or the per-trial start and finish timestamps in `~/code/curated-terminal-benchmark/results/*.json`. (From: leaderboard page fetch, `/benchmarks` and news-page grep, curated results rows) (Serves: Next)
+- wisp never caps a trial on its own: `DEFAULT_WALLCLOCK` is 24 h (`wisp/wisp` line 399), and Harbor's per-task agent timeout governs (900–3600 s in tb2, 28800 s in tb4). A uniform cap comes from `--agent-timeout-multiplier`; 0.0035 turns the tb4 28800 s into 101 s. (From: `wisp/wisp`, tb4 `task.toml` files, quick4 result.json phases) (Serves: Next)
+- The tb4 dataset runs from a path: `-p ~/code/curated-terminal-benchmark/artifacts/datasets/terminal-bench` resolves 66 task dirs and `-i NAME` selects tasks; `--print-config` confirms the selection without running. (From: `harbor run --print-config` output, dataset dir listing) (Serves: Next)
+- `harbor hub` needs `harbor auth login`; `harbor hub job list --scope all` fails with `NotAuthenticatedError`, so public Hub trials are unreachable here. (From: `harbor hub job list --json` output, `harbor hub --help`) (Serves: cold)
+- tb2 agent timeouts are 900 s for 49 tasks, 1800 s for 16, 3600 s for 12, 1200 s for 6, and `hello-world` alone is 120 s; the killed first pass hit 900 s and 1800 s agent timeout caps. (From: `~/.cache/harbor/tasks/*/*/task.toml`, `bench/jobs/tb2-first/2026-11-19__09-00-35/*/result.json`) (Serves: cold)
 
 # Pointers
 - Ticket: /home/pnagyux/code/wisp/.tickets/wisp-az7xi5/ticket.md
-- Repo: /home/pnagyux/code/wisp (session dirs: wisp-sessions/wisp-az7xi5-001 through -005)
-- Bench home: /home/pnagyux/code/wisp/bench/ (wisp_harbor.py, backfill.py, aggregate.py, bin/harbor, install.sh, README.md; untracked; jobs/ and .venv/ gitignored)
-- Harbor: /home/pnagyux/code/wisp/bench/.venv/bin/harbor (0.24.0); launcher: /home/pnagyux/code/wisp/bench/bin/harbor
-- Smoke jobs: /home/pnagyux/code/wisp/bench/jobs/smoke (backfilled), /home/pnagyux/code/wisp/bench/jobs/smoke2 (fresh, native cost)
+- Repo: /home/pnagyux/code/wisp (session dirs: wisp-sessions/wisp-az7xi5-001 through -006)
+- Bench home: /home/pnagyux/code/wisp/bench/ (wisp_harbor.py, backfill.py, aggregate.py, bin/harbor, install.sh, README.md)
+- Jobs: bench/jobs/quick4/2026-11-19__10-04-17 (2-task loop), bench/jobs/quick/2026-11-19__09-51-39 (hello-world), bench/jobs/tb2-first/2026-11-19__09-00-35 (killed pass, phase timings)
+- Harbor: /home/pnagyux/code/wisp/bench/.venv/bin/harbor (0.24.0); launcher /home/pnagyux/code/wisp/bench/bin/harbor
+- tb4 dataset: /home/pnagyux/code/curated-terminal-benchmark/artifacts/datasets/terminal-bench; published result rows: /home/pnagyux/code/curated-terminal-benchmark/results/*.json
+- tb2 cache: ~/.cache/harbor/tasks (89 tasks)
 - Model table: /home/pnagyux/.config/wisp/gratex-litellm-models.json
-- Registry index: https://raw.githubusercontent.com/laude-institute/harbor/main/registry.json
